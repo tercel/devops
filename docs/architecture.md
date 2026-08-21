@@ -149,14 +149,41 @@ into one is a bug that survives into every conclusion drawn from it:
 
 ```rust
 pub struct Evidence {
-    // ...
-    pub observer:  Observer,   // WHO looked
-    pub authority: Authority,  // WHOSE data this is
+    pub kind:      EvidenceKind,
+    pub source:    String,          // file:line, command line, or URL
+    pub excerpt:   Option<String>,  // the raw text read
+    pub parsed:    Option<Value>,   // what the check made of it
+    pub observer:  Observer,        // WHO looked
+    pub authority: Authority,       // WHOSE data this is
 }
 
-pub enum Observer  { Origin, External }
-pub enum Authority { LocalHost, DirectProbe, CloudflareEdge, CloudflareAnalytics }
+pub enum EvidenceKind {
+    Config, Command, Log, Probe, Error, OperatorInput,
+}
+
+pub enum Observer {
+    Origin,     // measured on the host under diagnosis
+    External,   // measured off-host
+    Declared,   // nothing was measured; a person stated it (§3.11)
+}
+
+pub enum Authority {
+    LocalHost,            // the host's own state: /proc, config, process table
+    DirectProbe,          // a request that reached the origin without the edge
+    CloudflareEdge,       // a response the edge itself produced
+    CloudflareAnalytics,  // the edge's own records, queried after the fact
+    OperatorDeclaration,  // business intent, not machine state (§3.11)
+}
 ```
+
+Both fields are **mandatory on every `Evidence`**, including operator input —
+which is why `Declared` / `OperatorDeclaration` exist rather than an absent
+field. `Observer::Declared` and `Authority::OperatorDeclaration` occur only
+together; every pairing of the other two observers with the other four
+authorities is legal. Serialized forms are the snake_case of the variant
+(`origin`, `external`, `declared`; `local_host`, `direct_probe`,
+`cloudflare_edge`, `cloudflare_analytics`, `operator_declaration`) and appear on
+every evidence object in §4.
 
 They are orthogonal. Running `curl https://site.example.com` **on the origin**
 produces `observer = Origin` with `authority = CloudflareEdge`: the binary ran
@@ -178,6 +205,36 @@ Neither belongs to the run. One run routinely produces several of each:
 `watch-52x.sh` already records an edge probe, a local probe and an upstream
 probe on a single CSV row. Any design making either dimension a run-level mode
 fails on its first real use case.
+
+#### Vantage — the named pair a fact key can carry
+
+Evidence records the two dimensions separately. A **fact key** cannot: a key is
+a compile-time constant (§3.8) and a pair of enums is not a segment. So the
+small set of pairs that actually occur is named, and that name — never the word
+`observer` — is what appears in a key:
+
+```rust
+/// A named (observer, authority) pair. The only composite this document admits.
+pub enum Vantage {
+    OriginView,    // Observer::Origin        + Authority::CloudflareEdge
+    ExternalView,  // Observer::External      + Authority::CloudflareEdge
+    Analytics,     // either observer         + Authority::CloudflareAnalytics
+    LocalView,     // Observer::Origin        + Authority::LocalHost | DirectProbe
+    Declared,      // Observer::Declared      + Authority::OperatorDeclaration
+}
+```
+
+Serialized: `origin_view`, `external_view`, `analytics`, `local_view`,
+`declared`.
+
+`Analytics` covers both observers on purpose, and this is not a shortcut: §2.5's
+coverage table has the same row, because Analytics data describes every PoP
+regardless of where the query was issued from. For the two `*_view` vantages the
+observer is the whole point, and they stay distinct.
+
+**A vantage is recorded, never declared.** It is derived from what actually
+happened during the run — the same reason §6 refuses a `--vantage` flag. Naming
+the pair makes it expressible in a key; it does not make it selectable.
 
 **Operator input is evidence too.** Some conclusions rest on knowledge only a
 person has — which endpoints are legitimately slow, whether the application
@@ -211,6 +268,11 @@ pub struct Fact {
     pub scope: Scope,
 }
 
+/// *Runtime* scope — what one fact, outcome or finding belongs to.
+/// Distinct from `ScopeKind` (§3.1), which is static metadata on the check.
+/// Serialized with a discriminator so a consumer never has to probe for keys:
+///   {"kind":"host"}
+///   {"kind":"target","target":"t1","hostname":"a.example.com"}
 pub enum Scope { Host, Target(TargetId) }
 
 pub struct Target {
@@ -238,26 +300,26 @@ prototype, not the other way round.
 
 A check may publish **facts** — small typed key/values — into the shared fact
 set: `process.supervision.instance_count = 1` (scoped to a target),
-`edge.origin_view.http.status_codes = [520, 522]` (scoped to a target),
+`edge.cloudflare.origin_view.http.status_codes = [520, 522]` (scoped to a target),
 `system.memory.is_under_pressure = true` (host).
 
 **Correlation rules** then match over facts and check statuses to emit
 higher-order findings:
 
 ```
-edge.origin_view.http.status_codes ⊇ {520, 522}
+edge.cloudflare.origin_view.http.status_codes ⊇ {520, 522}
   AND process.supervision.instance_count = 1    // pm2 fork, a single systemd unit,
                                             // a one-replica Deployment — same fact
   AND system.memory.is_under_pressure          // Host-scoped, visible to every target
   → "upstream is restarting under memory pressure"
 
-edge.origin_view.http.status_codes ∋ 522  AND  kernel.net.listen_overflows_in_window > 0
+edge.cloudflare.origin_view.http.status_codes ∋ 522  AND  kernel.net.listen_overflows_in_window > 0
   → "listen queue overflow, not a network fault"
 
-edge.origin_view.http.status_codes ∋ 520  AND  nginx.error_log.entry_count_in_window == 0
+edge.cloudflare.origin_view.http.status_codes ∋ 520  AND  nginx.error_log.entry_count_in_window == 0
   → 520-at-nginx ruled out; evidence points upstream
 
-edge.origin_view.http.status_codes ∋ 520  AND  nginx.keepalive.timeout_seconds < 900
+edge.cloudflare.origin_view.http.status_codes ∋ 520  AND  nginx.keepalive.timeout_seconds < 900
   → "origin closes idle connections before the edge stops reusing them"
 ```
 
@@ -339,8 +401,13 @@ carelessly, the "None" row above discards one of the strongest signals
 available; the rule is about the loopback path, not about response headers in
 general.
 
-One strong signal activates the profile; two moderate ones activate it; less
-than that is `skip { NotApplicable }`.
+One strong signal activates the profile; two moderate ones activate it. Below
+that the profile does **not** simply become `skip { NotApplicable }`: positive
+evidence that this site is served directly is `NotApplicable`, whereas evidence
+too thin to decide either way is `unknown` (§3.10.1). "This site is not behind
+Cloudflare" and "I could not tell" are the §2.2 distinction, and a profile that
+collapses them gives an operator no way to know that the advice was withheld
+rather than judged irrelevant.
 
 **The log-based signal inverts, and an implementation that misses this will be
 wrong on the best-configured hosts.** Where `set_real_ip_from` is correctly
@@ -407,11 +474,52 @@ One versioned document is the single source of truth. Every output format is a
 projection of it (§3.5). Nothing downstream may compute a verdict that is not
 already in the report.
 
+### 2.7 Normative vocabulary
+
+Every term below is defined once, in the section named, and serialized exactly
+as shown. The rest of this document explains *why* each is shaped the way it is;
+this table is the lookup an implementer needs, and where the two ever disagree
+this table is wrong and must be fixed rather than worked around.
+
+| Term | Means | Serialized form | Defined in |
+|---|---|---|---|
+| `Status` | What a check, correlation or assertion concluded | `pass` `warn` `fail` `skip` `unknown` | §2.2 |
+| `Severity` | Impact ordering, for display and sort only — **never** a verdict | `critical` `high` `medium` `low` `info` | §3.1 |
+| `ScopeKind` | *Static*: what a check is scoped to | `host` `target` | §3.1 |
+| `Scope` | *Runtime*: what one outcome or finding belongs to | `{"kind":"host"}` / `{"kind":"target","target":"t1","hostname":"…"}` | §2.4 |
+| `Observer` | Who looked — decides **coverage** | `origin` `external` `declared` | §2.3 |
+| `Authority` | Whose data it is — decides **what may be claimed** | `local_host` `direct_probe` `cloudflare_edge` `cloudflare_analytics` `operator_declaration` | §2.3 |
+| `Vantage` | The named (observer, authority) pair a fact key may carry | `origin_view` `external_view` `analytics` `local_view` `declared` | §2.3 |
+| `Domain` | Who *produces* evidence. May contain dots | `system` `kernel.net` `nginx` `process` `tls` `edge.cloudflare`, plus bundle-declared | §7 |
+| `IncidentClass` | Presentation/selection tag; cuts across domains | `52x`, plus bundle-declared | §3.12 |
+| `CheckId` | One check | `<domain>.<subject>_<predicate>` | §3.8 |
+| `FactKey` | One published measurement | `<domain>[.<vantage>][.<subsystem>].<measure>` | §3.8 |
+| `CorrelationId` | One higher-order finding | `<subject>.<what_is_happening>` | §3.8 |
+| `AssertionId` | One assertion inside a profile | `<profile-id>/<assertion>` | §3.8 |
+| `SignalId` | One activation signal inside a profile | `<profile-id>#<signal>` | §3.10 |
+| `InputKey` | One operator declaration | a TOML path: `app.slow_endpoints` | §3.11 |
+| `TargetId` | One discovered target, opaque and run-local | `t1` | §2.4 |
+| `SkipReason` | Why a `skip` | `not_applicable` `source_unconfigured` `retired` | §3.1 |
+| `UnknownReason` | Why an `unknown` | `permission_denied` `evidence_gone` `window_truncated` `timeout` `cancelled` `internal_error` `needs_input` `bundle_incompatible` | §3.1 |
+
+Two pairs in that table are routinely confused, and each confusion has a
+specific failure mode:
+
+- **`Severity` is not `Status`.** A check declares the severity it *would* carry
+  if it fired; the status is what it actually concluded. Severity orders output;
+  it never reaches an exit code. §3.1 and §3.4 state this as a rule because the
+  first draft of this document let a `critical` correlation imply `fail` without
+  ever saying so.
+- **`Observer` is not `Vantage`.** The first is one dimension of provenance on a
+  piece of evidence; the second is a *named pair* of both dimensions, and exists
+  only because a fact key needs one segment where evidence has two fields.
+  A key segment is never called `observer`.
+
 ---
 
 ## 3. Extension model
 
-Five axes, each designed so that extending along it requires no change to the
+Six axes, each designed so that extending along it requires no change to the
 core.
 
 | Axis | Extend by | Requires recompiling? |
@@ -421,7 +529,7 @@ core.
 | C. New output surface | Implement `Renderer` | Yes, in the surface crate only |
 | D. New evidence source | Implement `Source` | Yes, in `whatbroke-core` |
 | E. New execution context | Supply a different `RunContext` | No |
-| F. New incident playbook | Tag existing checks and rules, add a grouping renderer (§3.12) | Yes, for the tag / No (bundle, §3.3) |
+| F. New incident playbook | Tag existing checks, rules and profiles, name the optional sources they need, add a grouping renderer (§3.12) | Yes, for the tag / No (bundle, §3.3) |
 
 ### 3.1 The `Check` trait
 
@@ -442,15 +550,25 @@ pub trait Check: Send + Sync {
 /// other section of this document may introduce another one.
 pub struct CheckMeta {
     pub id: CheckId,          // "nginx.keepalive_below_idle_timeout"
+    pub aliases: &'static [CheckId],  // former ids, still accepted (§3.8)
     pub title: &'static str,
     pub domain: Domain,       // system | kernel.net | nginx | process | tls | edge.cloudflare
-    pub severity: Severity,   // severity IF it fires
+    pub severity: Severity,   // severity IF it fires — display order, not a verdict
     pub refs: &'static [&'static str],
     pub explain: &'static str, // what it inspects, why it matters, how to fix
     pub incidents: &'static [IncidentClass],  // presentation/selection tag (§3.12)
     pub requires_observer: ObserverReq,       // execution precondition
     pub scope: ScopeKind,                     // Host or Target (§2.4)
 }
+
+/// Impact ordering. It sorts output and nothing else: no severity anywhere in
+/// this document raises, lowers, or implies a `Status`, and none reaches the
+/// exit code. The verdict is always carried by a `Status` (§3.4).
+pub enum Severity { Critical, High, Medium, Low, Info }
+
+/// *Static* scope — a property of the check, known before the run.
+/// Distinct from `Scope` (§2.4), which is *runtime* and names the target.
+pub enum ScopeKind { Host, Target }
 
 /// A check's execution precondition — static metadata, distinct from the
 /// `observer` recorded on each piece of evidence at runtime (§2.3).
@@ -499,10 +617,11 @@ pub enum UnknownReason {
     Cancelled,
     InternalError,      // the check panicked (§3.9)
     NeedsInput { key: InputKey },  // only a person can answer this (§3.11)
-    PluginIncompatible,            // its bundle did not load (§3.3)
+    BundleIncompatible,            // its bundle did not load (§3.3)
 }
 
 pub struct CheckOutcome {
+    pub scope: Scope,              // which target this outcome is about (§2.4)
     pub status: Status,
     pub summary: String,
     pub evidence: Vec<Evidence>,
@@ -510,6 +629,26 @@ pub struct CheckOutcome {
     pub remediation: Option<String>,
 }
 ```
+
+**A check's `ScopeKind` decides how often it runs, and every outcome says which
+target it is about.** The rule is exactly the one §3.4 already applies to
+correlations, and there is no third case:
+
+| `CheckMeta.scope` | Runs | Yields | `CheckOutcome.scope` |
+|---|---|---|---|
+| `Host` | once per run | one outcome | `Scope::Host` |
+| `Target` | once per discovered target | **one outcome per target** | `Scope::Target(id)` |
+
+So one target-scoped check produces one `checks[]` row per target (§4), each
+carrying its own status, evidence and facts. A host-scoped check produces one
+row with `scope: {"kind":"host"}`. Both always carry the field: a row whose
+scope has to be inferred from whether the check *looks* per-site is a row a
+renderer will eventually attach to the wrong virtual host, and on a box with
+twenty vhosts that is not a rare accident.
+
+`scope` is stamped by the runner from `RunContext`, never invented by the check;
+an external check (§3.3) emits it on the wire and the runner rejects an outcome
+whose scope is not the one it was invoked for.
 
 `explain` lives on the check, not in prose, because the reference tables in the
 current README are the most reused part of this project and prose drifts away
@@ -537,6 +676,16 @@ not installed" and "pm2 is installed but could not be run" send a check to
 `skip` and `unknown` respectively (§2.2); collapsing them here makes that
 distinction unrecoverable downstream.
 
+**`Env` is addressed by key, not by field access**, under the same discipline as
+`FactKey` (§3.8): `EnvKey` is a closed registry of typed constants —
+`env.nginx.is_present`, `env.nginx.version`, `env.privileged`,
+`env.container.memory_limit_mb`. Profile activation predicates on `Env` (§3.10),
+and a predicate cannot name something that only exists as a struct field in one
+crate. Keys carry the `env.` prefix so no `Env` key can ever collide with a
+published `FactKey`; `Env` entries are **not** facts and never appear in
+`facts` (§4), because they describe the machine rather than any conclusion drawn
+about it.
+
 Where `Env` stops and §3.11 begins is not an arbitrary line: **`Env` measures
 technical fact; the operator supplies business intent.** Whether Node is running
 is measurable. Whether a 90-second endpoint is working as designed is not, and
@@ -548,18 +697,61 @@ Building it once matters for correctness, not just speed: forty checks each
 independently shelling out to `nginx -T` would produce forty possibly-different
 views of the config within one run.
 
-### 3.3 Registry and plugin bundles
+### 3.3 Registry, external checks, and bundles
 
 Built-in checks are registered explicitly in one `catalogue()` function —
 deterministic order, no macro magic, greppable.
 
-For extension **without recompiling**, the registry also accepts **external
-checks**: an executable in a drop-in directory that prints a `CheckOutcome` as
-JSON on stdout.
+#### Three words, three meanings
+
+Earlier drafts used "plugin" for all of these, and installation paths,
+ownership checks and CLI wording drifted apart accordingly. The words are fixed:
+
+| Word | Means | Never means |
+|---|---|---|
+| **external check** | one executable speaking §3.3.1's protocol | the directory it lives in |
+| **bundle** | one directory shipping any of the extensible kinds at once | a single executable; a fixture set (§3.6) |
+| **plugin** | the Netdata `whatbroke.plugin` binary (§8.1), and nothing else | anything in this section |
+
+"Plugin" is surrendered entirely to Netdata because Netdata already uses it for
+an external executable, and the two meanings would collide in exactly the place
+they meet. These are the terms used in CLI output, report fields and directory
+names, not just in prose.
+
+#### Discovery roots
+
+For extension **without recompiling**, the registry accepts external checks and
+bundles from **fixed roots**, resolved before anything is executed:
 
 ```
-$XDG_CONFIG_HOME/whatbroke/checks.d/*      →  executed, stdout parsed as CheckOutcome
+<root>/checks.d/*             a standalone external check  (§3.3.1)
+<root>/bundles.d/<name>/      a bundle
 ```
+
+```
+bundles.d/mysql/
+  manifest.toml        name, version, the schema versions it speaks, what it provides
+  checks/*             external checks (§3.3.1)
+  facts.toml           the fact keys it publishes, with declared types (§3.8)
+  rules/*.toml         correlation rules (§3.4)
+  profiles/*.toml      stack profiles (§3.10)
+  playbooks/*.toml     incident tags over its own and existing checks (§3.12)
+```
+
+Which roots are consulted depends on privilege, and this is the whole of the
+rule:
+
+| Run as | Roots | Every path component must be |
+|---|---|---|
+| root | `/etc/whatbroke/` | owned by root, not group- or world-writable |
+| an ordinary user | `/etc/whatbroke/`, then `$XDG_CONFIG_HOME/whatbroke/` | owned by root, or by the invoking user for the second root |
+
+**A privileged run ignores `$XDG_CONFIG_HOME` precisely because it is an
+environment variable the caller controls**, and a root process taking its
+executable search path from a caller-controlled variable has handed out root.
+The working directory is never a root at any privilege level. Where the same
+name appears in both roots the system one wins, so a user root can add
+capability but never shadow it.
 
 The contract is deliberately the same shape as the internal trait, so an
 external check is a first-class citizen: it appears in `whatbroke list`, it can
@@ -568,21 +760,7 @@ keys are for user-supplied rules — §3.8), and it is subject to the same timeo
 and cancellation. This is the extension path for site-specific
 knowledge that will never belong upstream.
 
-#### Bundles
-
-A single executable is the smallest unit; a **bundle** is the whole one. A
-plugin is a directory carrying any of the four extensible kinds at once, and
-dropping it in is the entire installation procedure:
-
-```
-plugins.d/mysql/
-  manifest.toml        name, version, the schema versions it speaks
-  checks/*             executables, stdout parsed as CheckOutcome
-  facts.toml           the fact keys it publishes, with declared types (§3.8)
-  rules/*.toml         correlation rules (§3.4)
-  profiles/*.toml      stack profiles (§3.10)
-  playbooks/*.toml     incident tags over its own and existing checks (§3.12)
-```
+#### First-class by construction
 
 **The CLI gains the capability without gaining code.** `run` executes the new
 checks, `list` shows them with their applicability, `explain` answers for them,
@@ -594,11 +772,13 @@ rather than a fork point.
 
 **Extending must never mean adding a verb.** The subcommand set — `run`,
 `list`, `explain`, `capture` — is closed, and a bundle cannot add to it. A
-plugin that ships its own verb ships its own output format and its own notion of
+bundle that ships its own verb ships its own output format and its own notion of
 a verdict, and a dozen of those is precisely the situation this project exists
 to replace: three shell scripts, three CSV layouts, no shared conclusion. New
 capability arrives as checks, facts, rules, profiles and tags, all of which land
 in the one report (§2.6).
+
+#### Loading, trust, and degradation
 
 **A bundle is executable code, and this process often runs as root.** Bundle
 discovery therefore uses a **fixed root** — never the working directory, never a
@@ -616,7 +796,7 @@ because "these forty checks did not run" is a finding either way.
 **Compatibility is a result, not a startup error.** A bundle whose declared
 schema versions this build does not speak is *not* rejected on stderr and
 forgotten: it appears in the report with its status, and every check it would
-have contributed appears as `unknown { PluginIncompatible }`. A run that quietly
+have contributed appears as `unknown { BundleIncompatible }`. A run that quietly
 omits forty MySQL checks and prints a clean verdict has lied, whatever it wrote
 to a terminal nobody was reading.
 
@@ -628,7 +808,9 @@ critically — what it *provides*:
 name    = "mysql"
 version = "1.2.0"
 speaks  = { check_protocol = "1", fact_schema = "1", rule_schema = "1" }
-provides = { domains = ["mysql"], checks = ["mysql.replication_lag", "mysql.connection_saturation"] }
+provides = { domains   = ["mysql"],
+             incidents = ["replication"],
+             checks    = ["mysql.replication_lag", "mysql.connection_saturation"] }
 ```
 
 `provides` is what makes an incompatible bundle legible. Without it the core
@@ -654,13 +836,87 @@ intermediate state to a built-in check belongs in the binary, compiled. Bundles
 cover site-specific knowledge and whole new domains; they do not replace
 built-in checks for hot paths.
 
+#### 3.3.1 The external check protocol
+
+`CheckOutcome` alone cannot carry a first-class check: it holds a verdict, not
+an identity. Nothing in it says which check produced it, what domain it belongs
+to, what `explain` should print, or which incidents it is tagged for — so a
+registry built only on it could run an external check but never list, explain or
+filter one, which is most of what §3.3 promises. The protocol therefore has two
+modes, and the executable must implement both.
+
+**Discovery — `describe`.** Invoked once per run, before any check executes. It
+must not touch the host and must answer within 1s:
+
+```
+$ ./mysql-checks describe
+{ "protocol": "1",
+  "checks": [
+    { "id": "mysql.replication_lag",
+      "aliases": [],
+      "title": "Replica is behind the primary",
+      "domain": "mysql",
+      "severity": "high",
+      "scope": "target",
+      "requires_observer": "origin",
+      "incidents": ["replication"],
+      "refs": ["https://dev.mysql.com/doc/..."],
+      "explain": "Reads SHOW REPLICA STATUS ...",
+      "publishes": [ { "key": "mysql.replication.lag_seconds", "type": "integer" } ] } ] }
+```
+
+Those fields are `CheckMeta` (§3.1) minus its Rust-isms, and the mapping is
+one-to-one by construction: **if a field is added to `CheckMeta` it is added
+here in the same change**, or external checks silently become second-class
+again.
+
+**Execution — `run`.** Invoked once per check, and once per target for a
+target-scoped one. The request arrives on **stdin** so that argv stays free of
+quoting hazards:
+
+```
+$ ./mysql-checks run
+  ← stdin:  { "protocol": "1", "check": "mysql.replication_lag",
+              "scope": { "kind": "target", "target": "t1", "hostname": "a.example.com" },
+              "window": { "from": "...", "to": "..." },
+              "privileged": false, "deadline_ms": 5000 }
+  → stdout: { "protocol": "1", "check": "mysql.replication_lag",
+              "scope": { "kind": "target", "target": "t1" },
+              "status": "fail", "summary": "...",
+              "evidence": [ ... ], "facts": [ ... ], "remediation": "..." }
+```
+
+The response repeats `check` and `scope` rather than letting the runner assume
+them, and the runner **rejects a response whose scope is not the one it asked
+about** (§3.1). An outcome silently attributed to the wrong vhost is worse than
+no outcome.
+
+The remaining semantics are stated so that two implementations cannot differ:
+
+| Concern | Rule |
+|---|---|
+| stdout | protocol only — exactly one JSON document, nothing else |
+| stderr | free-form; captured and attached as evidence when the check fails to answer |
+| exit status | `0` with a parseable response, or the outcome is `unknown { internal_error }` with stderr as evidence (§3.9) |
+| environment | sanitized; `WHATBROKE_PROTOCOL=1` is set, and nothing about the run is passed any other way |
+| timeout | §3.9's per-check deadline, enforced on the process **group** |
+| protocol version | `protocol` is a string, versioned independently of `schema_version` (§4), and a mismatch degrades exactly like an incompatible bundle |
+
+**The manifest covers what `describe` cannot.** An incompatible bundle's
+executables are never run, so `manifest.toml`'s `provides` block (above) carries
+the same identities declaratively. `describe` is the authority when the bundle
+loads; `provides` is what the report can still say when it does not. They
+overlap on purpose, and the loader reports a bundle whose `describe` contradicts
+its manifest rather than quietly picking a winner.
+
 ### 3.4 Correlation rules as data
 
 ```rust
 pub struct CorrelationRule {
-    pub id: RuleId,
+    pub id: CorrelationId,
     pub title: String,
-    pub severity: Severity,
+    pub status: Status,            // Warn or Fail only — what firing contributes
+    pub severity: Severity,        // display order only, never a verdict (§3.1)
     pub when: Vec<Predicate>,      // all must hold
     pub explanation: String,       // may interpolate matched facts
 }
@@ -671,6 +927,11 @@ pub enum Predicate {
     FactCmp { key: FactKey, op: CmpOp, value: FactValue },
     Not(Box<Predicate>),
 }
+
+/// Shared by every predicate language in this document — correlation rules,
+/// assertions, and profile activation (§3.10.1) — so a rule author learns one
+/// set of operators. Serialized as the lowercase name: `eq`, `gte`, `is_set`.
+pub enum CmpOp { Eq, Ne, Lt, Lte, Gt, Gte, IsSet, Matches }
 ```
 
 Because rules are data rather than conditionals, they can be loaded from file,
@@ -715,6 +976,35 @@ A correlation **may raise `summary.verdict`, never lower it**. Three independent
 exists to catch, and a conclusion that cannot move the exit code is one nobody's
 automation will ever act on. The converse is forbidden: no rule may explain away
 a `fail`.
+
+**What a fired correlation contributes is its declared `status`, not its
+severity.** This is the one roll-up rule, and every surface computes the verdict
+the same way:
+
+```
+summary.verdict = worst( every check outcome's status,
+                         every fired correlation's status,
+                         every profile assertion's status capped at warn )
+                  over the ordering  fail > warn > pass
+```
+
+`unknown` and `skip` never participate — they are counted, never rolled up
+(§2.2) — and `unevaluated` (§4) contributes nothing at all, because nothing was
+concluded.
+
+`Severity` is deliberately absent from that expression. A `critical` correlation
+does not imply `fail`; a rule that means "this run should fail" says
+`status = fail` and says it in the rule file, where a reviewer can see it.
+Deriving a verdict from a severity word would put the exit code at the mercy of
+a display attribute, and the first person to relabel a rule `high` for cosmetic
+reasons would silently change what the tool exits with. The two fields answer
+different questions: `status` is *did this run fail*, `severity` is *what do I
+look at first*.
+
+`status` is restricted to `Warn` and `Fail`. A correlation exists to add a
+finding; `pass` would be a rule that fires to announce nothing, and `skip` /
+`unknown` are already carried by `unevaluated` when a predicate could not be
+decided.
 
 ### 3.5 Renderers
 
@@ -810,7 +1100,7 @@ whatbroke capture --out fixtures/nginx-keepalive-65
 ```
 
 `capture` runs the normal catalogue against `LiveHost` and records every read,
-glob and exec into a bundle:
+glob and exec into a **fixture set** — never called a bundle (§3.3):
 
 ```
 fixtures/nginx-keepalive-65/
@@ -824,7 +1114,7 @@ fixtures/nginx-keepalive-65/
 Three rules keep the fixtures honest:
 
 - **A `FixtureHost` miss fails the test; it never returns an empty result.**
-  Reading a path the bundle does not contain panics with that path. Silently
+  Reading a path the fixture set does not contain panics with that path. Silently
   answering "not found" would let a check pass its tests by reading nothing at
   all — §2.2's false-healthy failure, reproduced inside the test suite.
 - **Every check ships at least three fixtures**: one where it fires, one where it
@@ -832,9 +1122,9 @@ Three rules keep the fixtures honest:
   exercised as deliberately as the other two.
 - **Capture redacts on write.** Access logs carry client IPs and hostnames.
   `capture` maps them through a stable pseudonymiser — identical input to
-  identical output *within* a bundle, so log-correlation checks still work — and
-  records in the manifest that it ran. A bundle that cannot be shared is a
-  bundle that will not be committed, and an uncommitted fixture protects nothing.
+  identical output *within* a fixture set, so log-correlation checks still work —
+  and records in the manifest that it ran. A fixture set that cannot be shared is
+  one that will not be committed, and an uncommitted fixture protects nothing.
 
 ### 3.7 `RunContext` — designing for execution models v1 does not have
 
@@ -842,11 +1132,17 @@ Three rules keep the fixtures honest:
 pub struct RunContext<'a> {
     pub env: &'a Env,
     pub host: &'a dyn HostAccess,
-    pub window: TimeWindow,        // for log/history analysis
+    pub target: Option<&'a Target>, // Some for a Target-scoped check (§3.1), None for Host
+    pub window: TimeWindow,         // for log/history analysis
     pub cancel: &'a CancelToken,
     pub progress: &'a dyn ProgressSink,
 }
 ```
+
+`target` is `Some` exactly when `CheckMeta.scope` is `Target`, and the runner
+guarantees it: a target-scoped check that had to rediscover which vhost it was
+looking at would re-derive, forty times over, the discovery `Env` already did
+once — and would be free to disagree with it.
 
 The CLI never cancels anything and reports progress to `/dev/null`. Both are in
 the signature from day one anyway, because the surfaces on the roadmap need
@@ -866,8 +1162,8 @@ cost paid entirely by other people.
 
 #### Check IDs
 
-Format `<domain>.<subject>_<predicate>`, lowercase, dot-separated —
-`nginx.keepalive_below_idle_timeout`.
+Format `<domain>.<subject>_<predicate>`, lowercase —
+`nginx.keepalive_below_idle_timeout`, `kernel.net.listen_queue_overflowing`.
 
 An ID appears in the report, in `explain <id>`, in `--check` globs, in
 correlation predicates, and in external check output. So:
@@ -888,34 +1184,79 @@ normative:
 
 | Kind | Shape | Example |
 |---|---|---|
-| **Fact key** | `<domain>[.<observer>][.<subsystem>].<measure>` — dot-separated nouns, last segment carrying a unit or type suffix | `nginx.keepalive.timeout_seconds` |
-| **Check id** | `<domain>.<subject>_<predicate>` — two dot-separated segments, second one a predicate | `nginx.keepalive_below_idle_timeout` |
+| **Fact key** | `<domain>[.<vantage>][.<subsystem>].<measure>` — dot-separated nouns, last segment carrying a unit or type suffix | `nginx.keepalive.timeout_seconds` |
+| **Check id** | `<domain>.<subject>_<predicate>` — one judgement inside one domain | `nginx.keepalive_below_idle_timeout` |
 | **Correlation id** | `<conclusion-subject>.<what_is_happening>` — the first segment names *what the finding is about*, drawn from a different vocabulary than `Domain` | `upstream.restarting_under_memory_pressure` |
 | **Assertion id** | `<profile-id>/<assertion>` — a slash, never a dot, because an assertion only exists inside its profile | `cloudflare-nginx-node/keepalive_above_idle_timeout` |
+| **Signal id** | `<profile-id>#<signal>` — a hash, so an activation signal is never read as an assertion (§3.10.1) | `cloudflare-nginx-node#access_log_client_ips_in_cf_ranges` |
 
 Before this rule those three were `nginx.keepalive.seconds`,
 `nginx.keepalive_below_cf_window` and `nginx.keepalive_above_idle_timeout` — a
 fact, a check and an assertion, indistinguishable at a glance, in a document
 where all three appear within a few paragraphs of each other.
 
-Check and correlation ids share a two-segment shape on purpose: both are one
-judgement within one area, and they never collide in practice because a
-correlation's first segment is a subject (`upstream`, `edge`) while a check's is
-a `Domain` (`nginx`, `process`, `kernel.net`). Where prose could still be read
-either way, the report field settles it — `checks[]` versus `correlations[]`.
+**Roles, not segment counts.** A `Domain` is a registered name and some
+registered names contain dots — `kernel.net`, `edge.cloudflare` (§7). A check in
+one of those has more than two dot-separated segments, so any rule phrased as
+"two segments" rejects ids this document itself declares valid:
+
+```
+nginx.keepalive_below_idle_timeout    domain nginx           · subject_predicate
+kernel.net.listen_queue_overflowing   domain kernel.net      · subject_predicate
+edge.cloudflare.origin_ip_exposed     domain edge.cloudflare · subject_predicate
+```
+
+Written out, with `segment ::= [a-z][a-z0-9]*`:
+
+```
+domain        ::= segment ( "." segment )*     -- and must be in the registry
+check-id      ::= domain "." segment ( "_" segment )+
+fact-key      ::= domain [ "." vantage ] { "." segment } "." measure
+correlation-id::= segment "." segment ( "_" segment )*
+assertion-id  ::= profile-id "/" segment ( "_" segment )*
+signal-id     ::= profile-id "#" segment ( "_" segment )*
+```
+
+**Parsing is longest-match against the domain registry, never a dot count.**
+`edge.cloudflare.analytics.http.status_codes` resolves because `edge.cloudflare`
+is the longest registered domain that prefixes it; everything after is vantage,
+subsystem, measure. This is also what keeps the four dotted shapes apart:
+`upstream.restarting_under_memory_pressure` is a correlation and not a check
+precisely because `upstream` is not a registered domain, and a correlation's
+first segment is a *subject* rather than a domain for exactly that reason. Two
+constraints keep the rule decidable, and both are enforced when a domain is
+registered:
+
+- **A domain segment may never be a vantage name.** No domain may contain
+  `origin_view`, `external_view`, `analytics`, `local_view` or `declared`, or a
+  fact key could split two ways.
+- **No registered domain may be a proper prefix of another at a check-id
+  boundary.** Registering both `edge` and `edge.cloudflare` would make
+  `edge.cloudflare_probe_failed` ambiguous. `edge` is therefore *not* a domain;
+  the vendor is part of the name, which is also how a second CDN arrives as
+  `edge.fastly` without disturbing anything.
+
+Where prose could still be read either way, the report field settles it —
+`checks[]` versus `correlations[]`.
 
 #### Fact keys
 
-Format `<domain>[.<observer>][.<subsystem>].<measure>`. **The segment count is
-not the rule; the roles are.** `measure` is always last, and `observer` — where
-one applies — always follows `domain`, because it qualifies where that domain's
-data came from, while `subsystem` qualifies what was measured:
+Format `<domain>[.<vantage>][.<subsystem>].<measure>`. **The segment count is
+not the rule; the roles are.** `measure` is always last, and `vantage` (§2.3) —
+where one applies — always follows `domain`, because it qualifies where that
+domain's data came from, while `subsystem` qualifies what was measured:
 
 ```
-system.memory.available_mb              domain · subsystem · measure
-nginx.keepalive.timeout_seconds         domain · subsystem · measure
-edge.origin_view.http.status_codes      domain · observer · subsystem · measure
+system.memory.available_mb                     domain · subsystem · measure
+nginx.keepalive.timeout_seconds                domain · subsystem · measure
+edge.cloudflare.origin_view.http.status_codes  domain · vantage · subsystem · measure
 ```
+
+The segment is called `vantage` and never `observer`. `Observer` and `Authority`
+are two independent fields on a piece of evidence (§2.3); one key segment cannot
+carry both, and a segment named after only one of them while holding values like
+`analytics` — which is an *authority* — is how a rule author ends up matching
+origin-side probe results as though they were what visitors saw.
 
 **A protocol is a subsystem, never part of the measure name.** Writing
 `http_status_codes` looks harmless until a second protocol arrives and the
@@ -923,10 +1264,10 @@ protocol name is scattered through measure segments where nothing can query or
 validate it. As its own segment it extends cleanly:
 
 ```
-edge.origin_view.http.status_codes     520, 522, 200 …
-edge.origin_view.tls.alert_codes       handshake_failure, certificate_expired
-edge.origin_view.grpc.status_codes     14 = UNAVAILABLE
-edge.origin_view.dns.response_codes    NXDOMAIN, SERVFAIL
+edge.cloudflare.origin_view.http.status_codes     520, 522, 200 …
+edge.cloudflare.origin_view.tls.alert_codes       handshake_failure, certificate_expired
+edge.cloudflare.origin_view.grpc.status_codes     14 = UNAVAILABLE
+edge.cloudflare.origin_view.dns.response_codes    NXDOMAIN, SERVFAIL
 ```
 
 This matters because **code spaces do not share numbering**. gRPC's 14 and
@@ -942,8 +1283,8 @@ HTTP response arrived, 520 means one arrived and was malformed.** They are
 separate facts:
 
 ```
-edge.origin_view.http.status_codes                  codes actually received
-edge.origin_view.http.no_response_count_in_window   attempts that produced none
+edge.cloudflare.origin_view.http.status_codes                  codes actually received
+edge.cloudflare.origin_view.http.no_response_count_in_window   attempts that produced none
 ```
 
 **The last segment names a measurement and declares its unit or type.** A key
@@ -957,7 +1298,7 @@ whose reader has to guess the unit is a defect:
 | `_in_window` | counter, delta over `--window` only | `kernel.net.listen_overflows_in_window` |
 | `_pct`, `_ratio` | proportion | `system.disk.used_pct` |
 | `is_`, `has_` prefix | boolean | `system.memory.is_under_pressure` |
-| plural noun | set | `edge.origin_view.http.status_codes` |
+| plural noun | set | `edge.cloudflare.origin_view.http.status_codes` |
 
 Two of those rows exist because of specific ways this goes wrong:
 
@@ -977,30 +1318,31 @@ Two of those rows exist because of specific ways this goes wrong:
 **Banned segments**, because each has been ambiguous in this document already:
 `mode`, `type`, `status`, `state`, `info`, `data`, `value` (say what is being
 measured), `clean`, `ok`, `good`, `bad` (a judgement, not a measurement), and
-`seen`, `found` (subject unstated — and now redundant, since the observer is
+`seen`, `found` (subject unstated — and now redundant, since the vantage is
 already in the key).
 
 - **Keys are declared, not spelled.** `FactKey` is a registry of constants, not a
   string literal at the call site. A typo becomes a compile error instead of a
   rule that never matches, and "which rules consume this fact" stays greppable —
   the property that makes the rule layer reviewable at all.
-- **A key's type is frozen once published.** Widening `edge.http.status_codes` from a
-  scalar to a list is a breaking change that no compiler will report: the
+- **A key's type is frozen once published.** Widening
+  `edge.cloudflare.origin_view.http.status_codes` from a scalar to a list is a
+  breaking change that no compiler will report: the
   `FactCmp` predicate against it simply stops matching, and a rule that silently
   stops firing is worse than one that fails to load. Type changes need a new key.
 - **Facts carry parsed values, never prose.** `nginx.keepalive.timeout_seconds = 65`, not
   `"keepalive_timeout is 65s"`. The sentence belongs in `summary`, which no rule
   is permitted to read (§2.4).
-- **Where a fact could be observed from more than one observer, the observer
-  is part of the key.** `edge.origin_view.http.status_codes`,
-  `edge.external_view.http.status_codes` and `edge.analytics.http.status_codes` are three keys,
+- **Where a fact could be obtained from more than one vantage, the vantage
+  is part of the key (§2.3).** `edge.cloudflare.origin_view.http.status_codes`,
+  `edge.cloudflare.external_view.http.status_codes` and `edge.cloudflare.analytics.http.status_codes` are three keys,
   not one key with a qualifier, because they answer the same question with
   different authority (§2.5). A rule author then has to choose deliberately, and
   the mistake of matching origin-side probe results as though they described what
   visitors saw becomes unwriteable rather than a runtime surprise. A bare
-  `edge.http.status_codes` must never ship: adding the observer later would break every
-  rule already written against it (§3.8's type-freeze rule applies to meaning as
-  much as to type).
+  `edge.cloudflare.http.status_codes` — domain and measure, no vantage — must
+  never ship: adding the vantage later would break every rule already written
+  against it (§3.8's type-freeze rule applies to meaning as much as to type).
 
 - **External checks publish into a reserved namespace.** A closed registry and
   an external check (§3.3) that has no compiler cannot both be satisfied by one
@@ -1095,9 +1437,9 @@ programmers.
 
 ```rust
 pub struct Profile {
-    pub id: ProfileId,                 // "cloudflare-nginx-node"
+    pub id: ProfileId,             // "cloudflare-nginx-node"
     pub title: String,
-    pub applies_when: Vec<Predicate>,  // §3.4's predicate language, over Env
+    pub applies_when: Activation,  // §3.10.1 — NOT §3.4's predicate language
     pub assertions: Vec<Assertion>,
 }
 
@@ -1120,12 +1462,101 @@ per-assertion severity could only encode a distinction the report is forbidden
 to make. An assertion whose required facts are absent is `unknown`, never a
 pass — the same rule that governs checks, for the same reason.
 
+#### 3.10.1 Activation
+
+§2.5 asks two different questions before a profile applies, and a
+`Vec<Predicate>` — a plain conjunction — can express only the first of them.
+*"Is this the right shape of stack"* is an AND. *"Is this site really behind the
+edge"* is a **scored** judgement over evidence of differing strength: one strong
+signal activates, two moderate ones activate, anything less does not. Writing
+that as a conjunction is not a simplification, it is a different rule.
+
+```rust
+pub struct Activation {
+    pub requires: Vec<ActivationPredicate>,  // ALL must hold — the stack's shape
+    pub signals:  Vec<Signal>,               // SCORED — §2.5's evidence table
+}
+
+pub struct Signal {
+    pub id:       SignalId,   // "cloudflare-nginx-node#access_log_client_ips_in_cf_ranges"
+    pub strength: SignalStrength,
+    pub when:     ActivationPredicate,
+}
+
+pub enum SignalStrength { Strong, Moderate, Weak }
+
+/// Activation ranges over four things a correlation rule may not touch.
+pub enum ActivationPredicate {
+    Env    { key: EnvKey,      op: CmpOp, value: EnvValue },    // §3.2
+    Target { field: TargetField, op: CmpOp, value: Str },       // §2.4's Target
+    Fact   { inner: Predicate },                                // §3.4, over published facts
+    Input  { key: InputKey,    op: CmpOp, value: InputValue },  // §3.11
+    Not(Box<ActivationPredicate>),
+}
+
+pub enum TargetField { Hostname, ServerBlock, Upstream }
+```
+
+**The scoring threshold is the engine's, not the profile's.** A profile lists
+its signals and their strengths; it does not get to declare that two weak ones
+are enough. One `Strong`, or two `Moderate`, activates; `Weak` alone never does,
+and contributes only as corroboration a renderer may show. A per-profile
+threshold would let each profile pick the standard of evidence it is judged by,
+which is how "activation must be proven" (§2.5) degrades back into "activation
+is assumed".
+
+**Activation is evaluated after the check phase, alongside correlations.** Two
+of §2.5's three strong signals — the access-log client-IP ratio and a `CF-Ray`
+seen by an external probe — are *published by checks*. A profile cannot be
+activated before the evidence that activates it exists, so §3.9's run has three
+ordered phases: `Env` → checks → (correlations and profile activation together).
+`Activation::requires` may still read `Env` and `Target`, which are available
+from the start; only `Fact` predicates depend on the check phase.
+
+**Three-valued, like §3.4.** A signal whose predicate is `unknown` — the log was
+unreadable, the probe never ran — scores nothing rather than scoring against.
+A profile that reaches neither the activation threshold nor a positive
+refutation is `unknown` for that target, not `NotApplicable`: "I could not tell
+whether this site is behind Cloudflare" and "this site is not behind Cloudflare"
+are the §2.2 distinction again, one layer up. The `activated_by` block in §4
+records which signals fired and at what strength, so the decision is auditable
+rather than a boolean nobody can question.
+
 #### The first profile: `cloudflare-nginx-node`
 
-`applies_when`, evaluated **per target** (§2.4): this target's server block
-proxies to a Node upstream **and** Cloudflare is confirmed *for this hostname*
-by one of the signals in §2.5. Anything less is `skip { NotApplicable }` for
-that target, while its neighbours on the same host may still qualify.
+`applies_when`, evaluated **per target** (§2.4), in the two halves §3.10.1
+defines:
+
+```toml
+[applies_when]
+requires = [                                   # all of these, or the profile is inert
+  { target = "upstream",        op = "is_set" },
+  { env    = "env.node.is_present", op = "eq", value = true },
+]
+
+[[applies_when.signals]]                       # scored: one strong, or two moderate
+id = "cloudflare-nginx-node#access_log_client_ips_in_cf_ranges"
+strength = "strong"
+fact = { key = "nginx.access_log.client_ips_in_cf_ranges_pct", op = "gte", value = 95 }
+
+[[applies_when.signals]]
+id = "cloudflare-nginx-node#cf_ray_seen_by_external_probe"
+strength = "strong"
+fact = { key = "edge.cloudflare.external_view.http.cf_ray_present", op = "eq", value = true }
+
+[[applies_when.signals]]
+id = "cloudflare-nginx-node#set_real_ip_from_lists_cf_ranges"
+strength = "moderate"
+fact = { key = "nginx.real_ip.from_covers_cf_ranges", op = "eq", value = true }
+```
+
+`requires` is the stack's shape — this target proxies somewhere, and Node is
+present — and it reads `Target` and `Env`, both available before any check runs.
+The signals are §2.5's evidence table, and every one of them is a *fact*, so
+activation waits for the check phase. Anything below the threshold is
+`skip { NotApplicable }` for that target, while its neighbours on the same host
+may still qualify; evidence too thin to decide either way is `unknown`, not
+`NotApplicable` (§3.10.1).
 
 **`cloudflare-nginx-node/keepalive_above_idle_timeout`** — requires `nginx.keepalive.timeout_seconds >= 905`
 Cloudflare holds an idle origin connection for up to its 900s Proxy Idle
@@ -1164,7 +1595,7 @@ unusable on three of those four. pm2, systemd and K8s are each a producer of
 the assertion's. Redundancy also carries a precondition no probe can settle —
 the application must tolerate multiple processes (externalised sessions, sticky
 WebSockets) — so this reports a deployment risk and defers to
-`app_multi_process_safe` (§3.11) before recommending anything.
+`app.multi_process_safe` (§3.11) before recommending anything.
 
 **`cloudflare-nginx-node/node_heap_budget`** — requires `--max-old-space-size` set explicitly, and
 `instances × heap_mb` plus headroom below `min(system memory, cgroup limit)`
@@ -1188,13 +1619,20 @@ records some requests with the edge's address instead of the visitor's.
 A small closed set of questions cannot be answered by probing, because their
 answers are business intent rather than machine state (§3.2):
 
-| `InputKey` | Question | Consumed by |
-|---|---|---|
-| `slow_endpoints` | Which paths are legitimately long-running? | `cloudflare-nginx-node/read_timeout_layering` |
-| `needs_real_visitor_ip` | Does anything depend on the visitor's address — rate limits, geo rules, audit? | `cloudflare-nginx-node/real_ip_configured` |
-| `cloudflare.proxy_read_timeout_seconds` | Enterprise zones may raise the 125s budget as far as 6000s | `cloudflare-nginx-node/read_timeout_layering` |
-| `app_multi_process_safe` | Can the application run as more than one process — stateless or externalised sessions, sticky WebSockets? | `cloudflare-nginx-node/supervisor_restart_window` |
-| `production_hostnames` | Which of the configured `server_name`s carry real traffic? | external probes, edge checks |
+**An `InputKey` *is* its TOML path.** There is one serialized form, it is the
+dotted path in the file, and it is what appears in `needs` (§4) and in
+`unknown { NeedsInput }`. Rust may name the variant however it likes; that name
+is an implementation detail and never reaches a consumer. A table that says
+`app_multi_process_safe` while the file says `app.multi_process_safe` gives an
+operator two spellings and no way to tell which one the tool will accept.
+
+| `InputKey` | Type | Question | Consumed by |
+|---|---|---|---|
+| `app.slow_endpoints` | list of path | Which paths are legitimately long-running? | `cloudflare-nginx-node/read_timeout_layering` |
+| `app.multi_process_safe` | bool | Can the application run as more than one process — stateless or externalised sessions, sticky WebSockets? | `cloudflare-nginx-node/supervisor_restart_window` |
+| `cloudflare.proxy_read_timeout_seconds` | integer | Enterprise zones may raise the 125s budget as far as 6000s | `cloudflare-nginx-node/read_timeout_layering` |
+| `nginx.needs_real_visitor_ip` | bool | Does anything depend on the visitor's address — rate limits, geo rules, audit? | `cloudflare-nginx-node/real_ip_configured` |
+| `nginx.production_hostnames` | list of hostname | Which of the configured `server_name`s carry real traffic? | external probes, edge checks |
 
 ```toml
 # ./whatbroke.toml
@@ -1207,6 +1645,7 @@ proxy_read_timeout_seconds = 600   # Enterprise zone
 
 [nginx]
 needs_real_visitor_ip = true
+production_hostnames = ["a.example.com"]
 ```
 
 **Optional, never required.** A run with no input at all still produces every
@@ -1222,7 +1661,8 @@ Discovery order, first match wins per key, flags overriding files:
 2. `<app root>/whatbroke.toml`, where the app root is a **discovered property of
    a target** (§2.4) — pm2's `pm_cwd`, a systemd unit's `WorkingDirectory`,
    nginx's `root` — and emphatically *not* the process's working directory
-3. `$XDG_CONFIG_HOME/whatbroke/config.toml` (the same tree as bundles, §3.3)
+3. `$XDG_CONFIG_HOME/whatbroke/config.toml`, then `/etc/whatbroke/config.toml`
+   — the same roots, and the same privilege rule, as §3.3
 
 Entry 2 is anchored to the target rather than to `cwd` on purpose. An operator
 running `whatbroke` from `/root` mid-incident would otherwise silently get no
@@ -1325,6 +1765,7 @@ one incident class it knows.
       "id": "nginx.keepalive_below_idle_timeout",
       "domain": "nginx",
       "title": "keepalive_timeout is shorter than Cloudflare's 900s Proxy Idle Timeout",
+      "scope": { "kind": "target", "target": "t1", "hostname": "a.example.com" },
       "status": "fail",
       "severity": "high",
       "summary": "keepalive_timeout 65s < the 900s Proxy Idle Timeout; the edge reuses connections this origin already closed, which it reports as 520",
@@ -1333,34 +1774,61 @@ one incident class it knows.
           "kind": "config",
           "source": "/etc/nginx/nginx.conf:34",
           "excerpt": "keepalive_timeout 65;",
-          "parsed": { "seconds": 65 }
+          "parsed": { "seconds": 65 },
+          "observer": "origin",
+          "authority": "local_host"
         }
       ],
       "remediation": "Raise keepalive_timeout above 900s on server blocks behind Cloudflare.",
       "refs": ["https://developers.cloudflare.com/support/troubleshooting/http-status-codes/"]
     },
     {
+      "id": "nginx.keepalive_below_idle_timeout",
+      "domain": "nginx",
+      "title": "keepalive_timeout is shorter than Cloudflare's 900s Proxy Idle Timeout",
+      "scope": { "kind": "target", "target": "t2", "hostname": "admin.example.com" },
+      "status": "skip",
+      "severity": "high",
+      "reason": "not_applicable",
+      "summary": "admin.example.com is served directly; the edge's idle timeout does not apply to it"
+    },
+    {
       "id": "nginx.error_log_readable",
       "domain": "nginx",
+      "title": "The nginx error log can be read",
+      "scope": { "kind": "host" },
       "status": "unknown",
+      "severity": "medium",
       "reason": "permission_denied",
       "summary": "error log not readable; re-run as root",
       "evidence": [
-        { "kind": "error", "source": "/var/log/nginx/error.log", "excerpt": "Permission denied" }
+        {
+          "kind": "error",
+          "source": "/var/log/nginx/error.log",
+          "excerpt": "Permission denied",
+          "observer": "origin",
+          "authority": "local_host"
+        }
       ]
     },
     {
       "id": "process.pm2_in_fork_mode",
       "domain": "process",
+      "title": "pm2 is running in fork mode rather than cluster mode",
+      "scope": { "kind": "host" },
       "status": "skip",
+      "severity": "high",
       "reason": "not_applicable",
       "summary": "pm2 is not installed on this host"
     },
     {
       "id": "mysql.replication_lag",
       "domain": "mysql",
+      "title": "Replica is behind the primary",
+      "scope": { "kind": "host" },
       "status": "unknown",
-      "reason": "plugin_incompatible",
+      "severity": "high",
+      "reason": "bundle_incompatible",
       "summary": "provided by the mysql bundle, which did not load"
     }
   ],
@@ -1387,7 +1855,7 @@ one incident class it knows.
       "t1": {
         "process.pm2.is_clustered": false,
         "process.supervision.instance_count": 1,
-        "edge.origin_view.http.status_codes": [520, 522],
+        "edge.cloudflare.origin_view.http.status_codes": [520, 522],
         "nginx.keepalive.timeout_seconds": 65
       },
       "t2": {
@@ -1399,9 +1867,10 @@ one incident class it knows.
     {
       "id": "upstream.restarting_under_memory_pressure",
       "title": "Upstream is restarting under memory pressure",
+      "status": "fail",
       "severity": "critical",
-      "scope": { "target": "t1", "hostname": "a.example.com" },
-      "derived_from": ["edge.origin_view.http.status_codes", "process.supervision.instance_count", "system.memory.is_under_pressure"],
+      "scope": { "kind": "target", "target": "t1", "hostname": "a.example.com" },
+      "derived_from": ["edge.cloudflare.origin_view.http.status_codes", "process.supervision.instance_count", "system.memory.is_under_pressure"],
       "explanation": "While the process is down the edge cannot connect (522); when it dies mid-request the edge receives a truncated response (520)."
     }
   ],
@@ -1411,9 +1880,16 @@ one incident class it knows.
       "id": "mysql.replica_lag_under_load",
       "missing_facts": ["mysql.replication.lag_seconds"],
       "why": "the mysql bundle did not load"
+    },
+    {
+      "kind": "assertion",
+      "id": "cloudflare-nginx-node/header_budget",
+      "scope": { "kind": "target", "target": "t1", "hostname": "a.example.com" },
+      "missing_facts": ["nginx.error_log.upstream_header_too_big_count_in_window"],
+      "why": "the nginx error log was not readable"
     }
   ],
-  "plugins": [
+  "bundles": [
     {
       "name": "mysql",
       "version": "1.2.0",
@@ -1426,17 +1902,17 @@ one incident class it knows.
   "profiles": [
     {
       "id": "cloudflare-nginx-node",
-      "scope": { "target": "t2", "hostname": "admin.example.com" },
+      "scope": { "kind": "target", "target": "t2", "hostname": "admin.example.com" },
       "applicable": false,
       "reason": "not_applicable",
       "detail": "no Cloudflare evidence for this hostname; it is served directly"
     },
     {
       "id": "cloudflare-nginx-node",
-      "scope": { "target": "t1", "hostname": "a.example.com" },
+      "scope": { "kind": "target", "target": "t1", "hostname": "a.example.com" },
       "applicable": true,
       "activated_by": {
-        "signal": "access_log_client_ips_in_cf_ranges",
+        "signal": "cloudflare-nginx-node#access_log_client_ips_in_cf_ranges",
         "strength": "strong",
         "detail": "98.7% of 2431 unique client IPs, read from $realip_remote_addr",
         "ranges_snapshot": { "source": "cloudflare.com/ips-v4", "verified_on": "2026-08-14", "refreshed_this_run": false }
@@ -1465,18 +1941,18 @@ one incident class it knows.
           "id": "cloudflare-nginx-node/read_timeout_layering",
           "status": "unknown",
           "reason": "needs_input",
-          "needs": "slow_endpoints",
+          "needs": "app.slow_endpoints",
           "summary": "proxy_read_timeout is 60s; whether that is too short depends on which endpoints are meant to run long",
           "evidence": [
-            { "kind": "config", "source": "/etc/nginx/sites-enabled/app:22", "excerpt": "proxy_read_timeout 60s;", "parsed": { "seconds": 60 } }
+            { "kind": "config", "source": "/etc/nginx/sites-enabled/app:22", "excerpt": "proxy_read_timeout 60s;", "parsed": { "seconds": 60 }, "observer": "origin", "authority": "local_host" }
           ]
         },
         {
           "id": "cloudflare-nginx-node/supervisor_restart_window",
           "status": "pass",
           "evidence": [
-            { "kind": "operator_input", "source": "./whatbroke.toml", "excerpt": "app.multi_process_safe = true" },
-            { "kind": "command", "source": "pm2 jlist", "parsed": { "mode": "cluster", "instances": 4 } }
+            { "kind": "operator_input", "source": "./whatbroke.toml", "excerpt": "app.multi_process_safe = true", "observer": "declared", "authority": "operator_declaration" },
+            { "kind": "command", "source": "pm2 jlist", "parsed": { "mode": "cluster", "instances": 4 }, "observer": "origin", "authority": "local_host" }
           ]
         }
       ]
@@ -1485,13 +1961,47 @@ one incident class it knows.
 }
 ```
 
+The example is illustrative; the rules below are normative.
+
+#### Which fields are always present
+
+An optional field a consumer cannot predict is a field every consumer will
+handle differently. For each row of `checks[]`:
+
+| Always | Present only when |
+|---|---|
+| `id`, `domain`, `title`, `scope`, `status`, `severity`, `summary` | |
+| | `reason` — `status` is `skip` or `unknown` |
+| | `evidence` — the check gathered any; `unknown` rows routinely carry the error that produced them |
+| | `remediation` — `status` is `warn` or `fail` |
+| | `refs` — the check declares any |
+
+`title` and `severity` come from `CheckMeta` (§3.1) and therefore exist for
+every check that exists at all, including one that skipped and one supplied by a
+bundle that failed to load — the report can always name what did not run. The
+same principle governs `assertions[]`: `id` and `status` always, `reason` on
+`skip` / `unknown`, `observed` / `required` / `remediation` / `source` when the
+assertion was actually evaluated.
+
 Schema rules:
 
 - `schema_version` is mandatory and changes only on breaking edits.
 - Consumers must ignore unknown fields, so additive changes stay compatible.
-- `summary.verdict` is the rollup: worst of `fail > warn > pass`. **`unknown`
-  never rolls up into `fail`**, but is always reported separately in `counts` so
-  it cannot be mistaken for `pass`.
+- **Every evidence object carries `observer` and `authority`** (§2.3), with no
+  exception for operator input, which uses `declared` / `operator_declaration`.
+  A consumer that cannot see the provenance of an excerpt cannot tell an
+  origin-side probe from what a visitor would have seen, which is the single
+  mistake this document is most concerned with.
+- **Every `checks[]` row carries `scope`** (§3.1). A target-scoped check appears
+  **once per discovered target**, including the targets it skipped; a host-scoped
+  check appears once with `{"kind":"host"}`. Rows are ordered by catalogue
+  position, then by target id, so two runs against the same host stay diffable.
+- `summary.verdict` is the rollup defined in §3.4: worst of `fail > warn > pass`
+  over check statuses, fired correlation statuses, and assertion statuses capped
+  at `warn`. **`unknown` never rolls up into `fail`**, but is always reported
+  separately in `counts` so it cannot be mistaken for `pass`.
+- `severity` never participates in that rollup (§3.1). A `critical` correlation
+  fails the run because its `status` is `fail`, not because of the word.
 - A correlation may raise `summary.verdict`, never lower it (§3.4).
 - `run.window.covered_from` / `covered_to` appear whenever the evidence actually
   read is narrower than the window requested (§3.9).
@@ -1507,19 +2017,25 @@ Schema rules:
 - Any verdict resting on a declaration rather than a measurement carries an
   `operator_input` evidence entry naming the file or flag it came from (§2.3).
 - `unevaluated` lists rules and assertions that could not be decided because
-  facts were missing (§3.4). It never affects `summary.verdict` — nothing was
-  concluded — but omitting it would make "not evaluated" and "evaluated and
+  facts were missing (§3.4). `kind` is a closed set — `correlation` or
+  `assertion` — and an entry carries `scope` whenever the thing it names was
+  being evaluated against a target. It never affects `summary.verdict` — nothing
+  was concluded — but omitting it would make "not evaluated" and "evaluated and
   fine" identical to every consumer.
-- `plugins` reports every discovered bundle and its load status, including the
+- `bundles` reports every discovered bundle and its load status, including the
   checks an incompatible one leaves unavailable (§3.3). A bundle that failed to
   load is a fact about this run, not a startup diagnostic.
 - `facts` is split into `host` and per-target maps (§2.4). A consumer must not
   flatten them: the same key can hold different values for different targets,
   and merging them silently picks a winner.
-- Findings from target-scoped rules and profiles carry `scope`, and a profile
-  appears **once per target it was evaluated against** — including the ones it
-  did not apply to. "This profile is irrelevant to `admin.example.com`" is
-  information; its absence is indistinguishable from never having looked.
+- Findings from target-scoped checks, rules and profiles all carry `scope` in
+  the same shape, and a profile appears **once per target it was evaluated
+  against** — including the ones it did not apply to. "This profile is
+  irrelevant to `admin.example.com`" is information; its absence is
+  indistinguishable from never having looked.
+- `scope` always carries its `kind` discriminator (§2.4). A consumer never
+  infers scope from the presence of a `target` field, and never from whether a
+  check *looks* per-site.
 
 ---
 
@@ -1536,16 +2052,17 @@ whatbroke-core
   profiles/   stack profiles, as data (§3.10)
   input/      operator declarations: schema, discovery order (§3.11)
   playbooks/  incident tags and their grouping renderers (§3.12)
-  plugins/    bundle discovery, manifest parsing, subprocess protocol (§3.3)
+  bundles/    bundle discovery, manifest parsing, subprocess protocol (§3.3)
   report/     the §4 schema and its rollup
 whatbroke-cli   the v1 binary: argument parsing, terminal + JSON renderers
 ```
 
-The word **plugin** is reserved for the two genuine extension points — an
-external check in `checks.d/*` (§3.3) and the Netdata `whatbroke.plugin` binary
-(§8.1). Built-in functionality is a check inside a domain directory, never a
-"plugin", because Netdata already uses that word for an external executable and
-the two meanings would collide in exactly the place they meet.
+The word **plugin** appears in exactly one place in this codebase: the Netdata
+`whatbroke.plugin` binary (§8.1). An executable in `checks.d/*` is an *external
+check* and a directory in `bundles.d/*` is a *bundle* (§3.3); built-in
+functionality is a check inside a domain directory. Netdata already uses
+"plugin" for an external executable, and the two meanings would collide in
+exactly the place they meet.
 
 Planned, not built in v1, and deliberately additive:
 
@@ -1637,8 +2154,9 @@ catalogue, never a verb (§3.3).
 origin does not become an external prober by being handed an argument, and a
 flag that appears to offer that would relabel origin-side measurements as
 external ones — precisely the confusion §2.3 separates `observer` from
-`authority` to prevent. `--probe` states an action taken from wherever this
-process happens to run, and the report records the resulting `observer`
+`authority` to prevent. A `Vantage` (§2.3) is derived from what happened, never
+declared. `--probe` states an action taken from wherever this process happens to
+run, and the report records the resulting `observer` and `authority`
 honestly. A genuine external view comes from running the binary somewhere else
 and folding in what it saw, via `--import` — which is also the shape
 `probe-52x.sh` takes once absorbed (Appendix). Narrowing a run to what is
@@ -1789,9 +2307,11 @@ Netdata at all.
   (retention varies) and would let `edge.cloudflare.*` checks read what the edge
   actually returned, after the fact, with no probe running. Requires an API
   token — decide whether that is an optional capability or a core one.
-- **External check protocol stability.** §3.3 makes the external-check JSON a
-  public contract the moment it ships. It should probably be versioned
-  separately from the report schema.
+- **External check protocol stability.** Settled in §3.3.1: the wire protocol
+  carries its own `protocol` version, independent of `schema_version`. What
+  remains open is the deprecation policy — how long the runner keeps speaking
+  version *n-1* once *n* ships, which is a release-cadence question rather than
+  a design one.
 - **Netdata version floor.** §8.1 is verified against v2.11. The function
   protocol is older, but the minimum supported version is not established.
 - **SARIF export.** Attractive for CI consumers, but the runtime diagnostic
