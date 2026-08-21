@@ -238,26 +238,26 @@ prototype, not the other way round.
 
 A check may publish **facts** — small typed key/values — into the shared fact
 set: `process.supervision.instance_count = 1` (scoped to a target),
-`edge.origin_view.http_status_codes = [520, 522]` (scoped to a target),
+`edge.origin_view.http.status_codes = [520, 522]` (scoped to a target),
 `system.memory.is_under_pressure = true` (host).
 
 **Correlation rules** then match over facts and check statuses to emit
 higher-order findings:
 
 ```
-edge.origin_view.http_status_codes ⊇ {520, 522}
+edge.origin_view.http.status_codes ⊇ {520, 522}
   AND process.supervision.instance_count = 1    // pm2 fork, a single systemd unit,
                                             // a one-replica Deployment — same fact
   AND system.memory.is_under_pressure          // Host-scoped, visible to every target
   → "upstream is restarting under memory pressure"
 
-edge.origin_view.http_status_codes ∋ 522  AND  kernel.net.listen_overflows_in_window > 0
+edge.origin_view.http.status_codes ∋ 522  AND  kernel.net.listen_overflows_in_window > 0
   → "listen queue overflow, not a network fault"
 
-edge.origin_view.http_status_codes ∋ 520  AND  nginx.error_log.entry_count_in_window == 0
+edge.origin_view.http.status_codes ∋ 520  AND  nginx.error_log.entry_count_in_window == 0
   → 520-at-nginx ruled out; evidence points upstream
 
-edge.origin_view.http_status_codes ∋ 520  AND  nginx.keepalive.timeout_seconds < 900
+edge.origin_view.http.status_codes ∋ 520  AND  nginx.keepalive.timeout_seconds < 900
   → "origin closes idle connections before the edge stops reusing them"
 ```
 
@@ -888,7 +888,7 @@ normative:
 
 | Kind | Shape | Example |
 |---|---|---|
-| **Fact key** | `<domain>.<subsystem>.<measure>` — three dot-separated segments, all nouns, last one carrying a unit or type suffix | `nginx.keepalive.timeout_seconds` |
+| **Fact key** | `<domain>[.<observer>][.<subsystem>].<measure>` — dot-separated nouns, last segment carrying a unit or type suffix | `nginx.keepalive.timeout_seconds` |
 | **Check id** | `<domain>.<subject>_<predicate>` — two dot-separated segments, second one a predicate | `nginx.keepalive_below_idle_timeout` |
 | **Correlation id** | `<conclusion-subject>.<what_is_happening>` — the first segment names *what the finding is about*, drawn from a different vocabulary than `Domain` | `upstream.restarting_under_memory_pressure` |
 | **Assertion id** | `<profile-id>/<assertion>` — a slash, never a dot, because an assertion only exists inside its profile | `cloudflare-nginx-node/keepalive_above_idle_timeout` |
@@ -906,7 +906,45 @@ either way, the report field settles it — `checks[]` versus `correlations[]`.
 
 #### Fact keys
 
-Format `<domain>.<subsystem>.<measure>` — `nginx.keepalive.timeout_seconds`.
+Format `<domain>[.<observer>][.<subsystem>].<measure>`. **The segment count is
+not the rule; the roles are.** `measure` is always last, and `observer` — where
+one applies — always follows `domain`, because it qualifies where that domain's
+data came from, while `subsystem` qualifies what was measured:
+
+```
+system.memory.available_mb              domain · subsystem · measure
+nginx.keepalive.timeout_seconds         domain · subsystem · measure
+edge.origin_view.http.status_codes      domain · observer · subsystem · measure
+```
+
+**A protocol is a subsystem, never part of the measure name.** Writing
+`http_status_codes` looks harmless until a second protocol arrives and the
+protocol name is scattered through measure segments where nothing can query or
+validate it. As its own segment it extends cleanly:
+
+```
+edge.origin_view.http.status_codes     520, 522, 200 …
+edge.origin_view.tls.alert_codes       handshake_failure, certificate_expired
+edge.origin_view.grpc.status_codes     14 = UNAVAILABLE
+edge.origin_view.dns.response_codes    NXDOMAIN, SERVFAIL
+```
+
+This matters because **code spaces do not share numbering**. gRPC's 14 and
+HTTP's 14 are unrelated; DNS's 2 (SERVFAIL) has nothing to do with either. A
+rule matching `∋ 520` is only meaningful because the key already declares which
+space the number lives in.
+
+**"No response" is not a status code.** The shell prototypes use `000` for a
+connection that never produced one, which is a curl convention, not HTTP. Folding
+it into `status_codes` would have rules matching `∋ 0`, and would reintroduce in
+the data model exactly the confusion this tool exists to resolve: **522 means no
+HTTP response arrived, 520 means one arrived and was malformed.** They are
+separate facts:
+
+```
+edge.origin_view.http.status_codes                  codes actually received
+edge.origin_view.http.no_response_count_in_window   attempts that produced none
+```
 
 **The last segment names a measurement and declares its unit or type.** A key
 whose reader has to guess the unit is a defect:
@@ -919,7 +957,7 @@ whose reader has to guess the unit is a defect:
 | `_in_window` | counter, delta over `--window` only | `kernel.net.listen_overflows_in_window` |
 | `_pct`, `_ratio` | proportion | `system.disk.used_pct` |
 | `is_`, `has_` prefix | boolean | `system.memory.is_under_pressure` |
-| plural noun | set | `edge.origin_view.http_status_codes` |
+| plural noun | set | `edge.origin_view.http.status_codes` |
 
 Two of those rows exist because of specific ways this goes wrong:
 
@@ -946,21 +984,21 @@ already in the key).
   string literal at the call site. A typo becomes a compile error instead of a
   rule that never matches, and "which rules consume this fact" stays greppable —
   the property that makes the rule layer reviewable at all.
-- **A key's type is frozen once published.** Widening `edge.http_status_codes` from a
+- **A key's type is frozen once published.** Widening `edge.http.status_codes` from a
   scalar to a list is a breaking change that no compiler will report: the
   `FactCmp` predicate against it simply stops matching, and a rule that silently
   stops firing is worse than one that fails to load. Type changes need a new key.
 - **Facts carry parsed values, never prose.** `nginx.keepalive.timeout_seconds = 65`, not
   `"keepalive_timeout is 65s"`. The sentence belongs in `summary`, which no rule
   is permitted to read (§2.4).
-- **Where a fact could be observed from more than one vantage, the vantage is
-  part of the key.** `edge.origin_view.http_status_codes`,
-  `edge.external_view.http_status_codes` and `edge.analytics.http_status_codes` are three keys,
+- **Where a fact could be observed from more than one observer, the observer
+  is part of the key.** `edge.origin_view.http.status_codes`,
+  `edge.external_view.http.status_codes` and `edge.analytics.http.status_codes` are three keys,
   not one key with a qualifier, because they answer the same question with
   different authority (§2.5). A rule author then has to choose deliberately, and
   the mistake of matching origin-side probe results as though they described what
   visitors saw becomes unwriteable rather than a runtime surprise. A bare
-  `edge.http_status_codes` must never ship: adding the vantage later would break every
+  `edge.http.status_codes` must never ship: adding the observer later would break every
   rule already written against it (§3.8's type-freeze rule applies to meaning as
   much as to type).
 
@@ -1349,7 +1387,7 @@ one incident class it knows.
       "t1": {
         "process.pm2.is_clustered": false,
         "process.supervision.instance_count": 1,
-        "edge.origin_view.http_status_codes": [520, 522],
+        "edge.origin_view.http.status_codes": [520, 522],
         "nginx.keepalive.timeout_seconds": 65
       },
       "t2": {
@@ -1363,7 +1401,7 @@ one incident class it knows.
       "title": "Upstream is restarting under memory pressure",
       "severity": "critical",
       "scope": { "target": "t1", "hostname": "a.example.com" },
-      "derived_from": ["edge.origin_view.http_status_codes", "process.supervision.instance_count", "system.memory.is_under_pressure"],
+      "derived_from": ["edge.origin_view.http.status_codes", "process.supervision.instance_count", "system.memory.is_under_pressure"],
       "explanation": "While the process is down the edge cannot connect (522); when it dies mid-request the edge receives a truncated response (520)."
     }
   ],
@@ -1540,7 +1578,7 @@ three long-lived threads and a mutex, not a reactor.
 Static linking against musl (`x86_64-unknown-linux-musl`,
 `aarch64-unknown-linux-musl`) so one artifact runs across distros with no glibc
 floor. **macOS is a supported target, not a development convenience**: the
-`external`-vantage checks (§2.3) are meant to run from a laptop, and an
+`External`-observer checks (§2.3) are meant to run from a laptop, and an
 anycast blind spot cannot be covered from the origin at all (§2.5).
 
 ### 5.3 Toolchain conventions
@@ -1574,7 +1612,7 @@ whatbroke run --config app.toml     # operator declarations (§3.11)
 whatbroke run --import probe.json   # fold in a report produced elsewhere (§2.3)
 whatbroke run --probe URL           # also probe this URL from wherever this is
                                     # running; repeatable. It states an action,
-                                    # not a vantage — probing the edge from the
+                                    # not an observer — probing the edge from the
                                     # origin is a normal thing to do (§2.3)
 
 whatbroke list                      # every known check, with applicability on this host
@@ -1808,7 +1846,7 @@ before it is correct.
 |---|---|
 | `diag-52x.sh` | The check catalogue plus the correlation rules — the core of the product |
 | `watch-52x.sh` | Retired. Netdata and `sar` already record; §8.1 covers the continuous signal |
-| `probe-52x.sh` | Absorbed. Its edge/colo logic becomes `edge.cloudflare.*` checks producing `external`-vantage evidence (§2.3), reached through `run --probe` rather than a verb of its own. The macOS build stops being a development convenience and becomes a supported target (§5.2) |
+| `probe-52x.sh` | Absorbed. Its edge/colo logic becomes `edge.cloudflare.*` checks producing `External`-observer evidence (§2.3), reached through `run --probe` rather than a verb of its own. The macOS build stops being a development convenience and becomes a supported target (§5.2) |
 | `client/`, `server/` | Removed. Push, ingest, and aggregation are redundant once a Netdata Parent exists (§1.2) |
 
 The scripts remain the specification of record until the equivalent checks exist
