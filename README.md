@@ -1,13 +1,27 @@
-# Cloudflare 52x Troubleshooting Toolkit
+# whatbroke
 
-Three scripts for diagnosing Cloudflare origin errors (520/521/522/524/526).
-All three are read-only: they observe and record, they never change anything.
+Server diagnostics that reach a **conclusion** instead of printing numbers.
+
+The target is a single static binary that runs a catalogue of read-only checks —
+resources, kernel and network limits, reverse-proxy configuration, process
+supervision, TLS, CDN-origin behaviour — and ends in a verdict. The design is in
+[docs/architecture.md](docs/architecture.md).
+
+**Status: that binary does not exist yet.** What ships today is the knowledge it
+will be built from — three read-only bash scripts for diagnosing Cloudflare
+origin errors (520/521/522/524/526). They are the specification of record: the
+check catalogue and correlation rules described in the architecture are a port
+of what is already in them, and they are not deleted on the promise of a
+rewrite.
 
 ```
 diag-52x.sh    run on the server    post-incident forensics: why it broke
 watch-52x.sh   run on the server    continuous recording: what the host was doing that second
 probe-52x.sh   run on your laptop   outside view: when it broke, which PoP, whose fault
 ```
+
+All three are read-only: they observe and record, they never change anything.
+Where each one lands in the rewrite is in [section 10](#10-where-this-is-going).
 
 ---
 
@@ -189,6 +203,8 @@ the observer and the thing being observed:
 ./probe-52x.sh -o ORIGIN_IP -k https://your-domain.example/   # compare against the origin
 ```
 
+Several URLs may be passed at once; each is probed on every pass.
+
 | Option | Default | Description |
 |---|---|---|
 | `-1` | — | Single check, prints the full response headers |
@@ -286,9 +302,55 @@ recorded zeros when they were missing.
   run in the foreground once and confirm that the "Discovered sites" section of
   `diag` picked up the right sites before backgrounding anything.
 
+This caveat is one of the reasons the rewrite exists: the `System` seam in
+[architecture §3.6](docs/architecture.md) puts every filesystem and process
+access behind a trait that fixtures can stand in for, which turns "never tested
+on Linux" into a test suite that runs anywhere.
+
+---
+
 ## 9. Notes
 
 - `-n` means different things in two of the scripts: in `diag-52x.sh` it caps
   the number of sites, in `watch-52x.sh` it sets the `Host` header.
 - All three scripts are read-only. They never modify configuration and never
   restart a service.
+
+---
+
+## 10. Where this is going
+
+[docs/architecture.md](docs/architecture.md) is the design for v1: a single
+`whatbroke` binary that runs the same knowledge as a catalogue of independent
+checks, publishes typed **facts**, and matches **correlation rules** over them —
+so "520 and 522 alternating means the upstream is restarting under memory
+pressure" becomes a rule the tool applies, not a paragraph a human has to
+remember to read.
+
+Two things carry over from these scripts and are worth knowing before reading
+the architecture:
+
+- **Five verdict states, not three.** `pass / warn / fail` plus `skip` (not
+  applicable — no nginx here) and `unknown` (applicable but undeterminable —
+  needed root, log already rotated). Without them, "no findings" silently reads
+  as "healthy".
+- **Evidence is mandatory.** Every verdict carries the command run, the file and
+  line read, and the raw excerpt — so an operator can confirm it and an AI agent
+  can reason past a wrong verdict instead of inheriting it.
+
+Where each script lands:
+
+| Today | Becomes |
+|---|---|
+| `diag-52x.sh` | The check catalogue plus the correlation rules — the core of the product |
+| `watch-52x.sh` | Retired. Netdata and `sar` already record; the Netdata plugin surface covers the continuous signal |
+| `probe-52x.sh` | Stays a laptop-side tool for now; its edge/colo logic becomes `edge.cloudflare.*` checks |
+
+### Removed
+
+An earlier revision of this repo shipped a Python client/server monitoring agent
+(`client/` + `server/`) covering the same CPU/memory/disk ground as
+`watch-52x.sh`, built to push snapshots across a fleet. It is gone: push,
+ingest and aggregation are a second, less mature copy of what a Netdata Parent
+already does, and building it is how this project turns into a worse Netdata.
+The reasoning is in [architecture §1.2](docs/architecture.md).
