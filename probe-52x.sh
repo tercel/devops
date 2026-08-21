@@ -81,6 +81,18 @@ if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || [ "$INTERVAL" -lt 5 ]; then
   echo "-i must be an integer of at least 5 seconds" >&2
   exit 1
 fi
+# The URL is written into a comma-separated row as-is. A comma is legal in a
+# query string, and one would shift `code` and every column after it, so the
+# awk filters in the README would silently read the wrong field. Refuse rather
+# than corrupt a file whose whole purpose is to be trusted after the fact.
+for _u in "${URLS[@]}"; do
+  case "$_u" in
+    *,*|*$'\n'*|*$'\r'*)
+      echo "URL contains a comma or newline, which would corrupt the CSV: ${_u}" >&2
+      echo "Percent-encode it (%2C) or use a URL without one." >&2
+      exit 1 ;;
+  esac
+done
 command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
 
 C_RED=$'\033[0;31m'; C_YEL=$'\033[0;33m'; C_GRN=$'\033[0;32m'; C_OFF=$'\033[0m'
@@ -135,14 +147,40 @@ probe_edge() {
   }'
 }
 
+# Split scheme://[user@]host[:port]/path into host and port. The port is not
+# cosmetic: --resolve only takes effect for the port curl actually connects to,
+# so mapping an explicit :8443 onto 443 leaves the "direct to origin" probe
+# going through normal DNS — measuring the edge again while reporting it as the
+# origin. Bracketed IPv6 literals are handled here too; the previous one-line
+# sed reduced "[::1]:8080" to "[".
+PA_HOST=""; PA_PORT=""
+parse_authority() {
+  local url="$1" auth
+  auth="${url#*://}"; auth="${auth%%/*}"; auth="${auth##*@}"
+  case "$auth" in
+    \[*\]:*) PA_HOST="${auth%]:*}]"; PA_PORT="${auth##*]:}" ;;
+    \[*\])   PA_HOST="$auth";        PA_PORT="" ;;
+    *:*)     PA_HOST="${auth%:*}";   PA_PORT="${auth##*:}" ;;
+    *)       PA_HOST="$auth";        PA_PORT="" ;;
+  esac
+  if ! [[ "$PA_PORT" =~ ^[0-9]+$ ]]; then
+    case "$url" in https://*) PA_PORT=443 ;; *) PA_PORT=80 ;; esac
+  fi
+}
+
 # --resolve pins the connection to the origin while keeping Host and SNI intact,
 # so this is the same request the edge would make — just without the edge.
 probe_origin() {
-  local url="$1" host port raw
-  host="$(printf '%s' "$url" | sed -E 's#^[a-z]+://##; s#/.*##; s#:.*##')"
-  case "$url" in https://*) port=443 ;; *) port=80 ;; esac
+  local url="$1" raw rip
+  parse_authority "$url"
+  # curl wants an IPv6 target address in brackets inside --resolve
+  case "$ORIGIN_IP" in
+    \[*\]) rip="$ORIGIN_IP" ;;
+    *:*)  rip="[${ORIGIN_IP}]" ;;
+    *)    rip="$ORIGIN_IP" ;;
+  esac
   raw="$(curl -sS -k --noproxy '*' -o /dev/null --max-time 20 \
-         --resolve "${host}:${port}:${ORIGIN_IP}" \
+         --resolve "${PA_HOST}:${PA_PORT}:${rip}" \
          -w '%{http_code} %{time_starttransfer}' "$url" 2>/dev/null)"
   [ -z "$raw" ] && raw="000 0"
   printf '%s' "$raw" | awk '{printf "%d,%d", $1, $2 * 1000}'

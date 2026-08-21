@@ -16,9 +16,13 @@
 #
 #   edge=522, local=200            the host served fine but the edge could not
 #                                  reach it: network, firewall, or keepalive
-#   edge=520, upstream=000         the backend was down; nginx had nothing to
-#                                  proxy to. This is the common cause of a 520
-#                                  that fixes itself once pm2 restarts the app.
+#   edge=520, upstream=000         the backend was down and nginx had nothing
+#                                  to proxy to. Note that nginx's own 502 is
+#                                  normally passed through by the edge, so a
+#                                  520 on this row means that edge request got
+#                                  an empty or truncated response instead. The
+#                                  three probes are separate requests taken in
+#                                  one second, not one request seen three ways.
 #   edge=520, upstream=200         the backend answered but produced something
 #                                  unparseable — check header size and resets
 #   edge=52x, iowait/steal spike   resource stall, see the same row
@@ -51,6 +55,7 @@ export LC_ALL=C
 INTERVAL=30
 CSV=/var/log/52x-watch.csv
 PIDFILE=/var/run/52x-watch.pid
+LOCKDIR=/var/run/52x-watch.lock
 KILL_MODE=0
 LOCAL_URL="http://127.0.0.1/"
 LOCAL_HOST=""
@@ -77,7 +82,7 @@ done
 if [ "$KILL_MODE" -eq 1 ]; then
   stopped=0
   if [ -r "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    kill "$(cat "$PIDFILE")" && rm -f "$PIDFILE" && stopped=1
+    kill "$(cat "$PIDFILE")" && rm -f "$PIDFILE" && rm -rf "$LOCKDIR" && stopped=1
     echo "watcher stopped (pidfile)"
   fi
   if [ "$stopped" -eq 0 ]; then
@@ -110,15 +115,38 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-# Refuse to start a second instance: two writers on one CSV interleave rows and
-# each keeps its own counter baseline, which corrupts every delta column.
-if [ -r "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-  echo "watcher already running as PID $(cat "$PIDFILE") — stop it with: $0 -k" >&2
-  exit 1
-fi
-
 command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
 command -v ss   >/dev/null 2>&1 || { echo "ss (iproute2) is required" >&2; exit 1; }
+
+# Refuse to start a second instance: two writers on one CSV interleave rows and
+# each keeps its own counter baseline, which corrupts every delta column.
+#
+# mkdir is atomic on every POSIX filesystem, so two watchers racing cannot both
+# win. Testing the pidfile and writing it later is not: the gap between the two
+# is wide enough to run `nginx -T` through, which is exactly what this script
+# does during startup discovery.
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  # The owner's pid lives INSIDE the lock and is written immediately after the
+  # mkdir that won it. Reading it from a pidfile written later — after startup
+  # discovery — would put the `nginx -T` call back inside the race window and
+  # let every loser declare the lock stale and take it.
+  _owner="$(cat "${LOCKDIR}/pid" 2>/dev/null || true)"
+  if [ -z "$_owner" ]; then
+    # A winner that has not written its pid yet is microseconds old, not
+    # abandoned. Give it one beat before concluding anything.
+    sleep 1
+    _owner="$(cat "${LOCKDIR}/pid" 2>/dev/null || true)"
+  fi
+  if [ -n "$_owner" ] && kill -0 "$_owner" 2>/dev/null; then
+    echo "watcher already running as PID ${_owner} — stop it with: $0 -k" >&2
+    exit 1
+  fi
+  # Lock left behind by an instance that was killed without cleanup.
+  echo "clearing a stale lock at ${LOCKDIR}" >&2
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR" 2>/dev/null || { echo "cannot acquire ${LOCKDIR}" >&2; exit 1; }
+fi
+echo $$ > "${LOCKDIR}/pid"
 
 # Read the upstream port and a Host header off the running config rather than
 # making the operator supply values the machine already knows. Explicit flags
@@ -146,8 +174,10 @@ if [ -z "$UP_PORT" ] || [ -z "$LOCAL_HOST" ]; then
   fi
 fi
 
-echo $$ > "$PIDFILE" 2>/dev/null || true
-trap 'rm -f "$PIDFILE"; exit 0' INT TERM
+# The lock is held and carries the owning pid; the pidfile is kept as the
+# documented handle for -k.
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"; rm -rf "$LOCKDIR"; exit 0' INT TERM
 
 HEADER="ts,load1,mem_avail_mb,swap_used_mb,dirty_mb,iowait_pct,steal_pct,estab,syn_recv,time_wait,listen_ovf,listen_drop,conntrack,ct_pct,nginx_up,nginx_workers,local_code,local_ms,up_code,up_ms,edge_code,edge_ms"
 

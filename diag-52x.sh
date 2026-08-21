@@ -5,19 +5,21 @@
 # The 52x codes are DIFFERENT failures with different causes. Read the verdict
 # against the code the edge actually returned:
 #
-#   520  The edge connected fine, but this origin answered with something it
-#        could not parse: an empty reply, a reset mid-response, or oversized
-#        headers. Almost always the upstream app crashed / was OOM-killed, or
-#        an nginx worker died.                              -> section 6b
+#   520  The edge connected fine, but this origin answered something empty,
+#        malformed or unexpected: a reset mid-response, or headers above
+#        Cloudflare's 128 KB limit. It is also what a connection left idle
+#        past the 900s Proxy Idle Timeout comes back as. Usually the upstream
+#        app crashed / was OOM-killed, or an nginx worker died.
+#                                                           -> section 6b
 #   521  The origin refused the connection outright: nginx down, or a firewall
 #        REJECT rather than DROP.                           -> section 5
-#   522  The edge could not complete a TCP handshake at all: listen-queue
-#        overflow, conntrack exhaustion, memory/IO collapse, or a
-#        keepalive_timeout shorter than Cloudflare's reuse window.
+#   522  The edge gave up connecting: no SYN+ACK within 19s, or no ACK of its
+#        request within 90s once connected. Listen-queue overflow, conntrack
+#        exhaustion, memory/IO collapse, or keepalives disabled at the origin.
 #                                                           -> section 8/5/4
 #   524  The connection succeeded but the origin did not finish the response
-#        within 100s. A slow upstream, not a connectivity fault.
-#                                                           -> section 6b
+#        within the 125s Proxy Read Timeout. A slow upstream, not a
+#        connectivity fault.                                -> section 6b
 #
 # 520 and 522 alternating on the same host usually means one thing: the
 # upstream application is restarting under memory pressure.
@@ -58,7 +60,7 @@ while getopts "H:d:w:o:s:n:h" opt; do
     o) OUTFILE="$OPTARG" ;;
     s) SITES="$OPTARG" ;;
     n) MAX_SITES="$OPTARG" ;;
-    h) sed -n '3,38p' "$0"; exit 0 ;;
+    h) sed -n '3,40p' "$0"; exit 0 ;;
     *) echo "Unknown option. Use -h for help." >&2; exit 0 ;;
   esac
 done
@@ -71,6 +73,22 @@ if ! [[ "$HOURS_BACK" =~ ^[0-9]+$ ]] || [ "$HOURS_BACK" -lt 1 ]; then
 fi
 
 [ -z "$LOG_DATE" ] && LOG_DATE="$(date +%d/%b/%Y)"
+
+# -d and -w are interpolated into the command strings run() evaluates, so they
+# are validated as literal patterns rather than trusted. A log timestamp needs
+# none of the characters a shell would act on, and this script runs as root.
+if ! [[ "$LOG_DATE" =~ ^[0-9]{2}/[A-Za-z]{3}/[0-9]{4}$ ]]; then
+  echo "-d must be dd/Mon/yyyy (e.g. 17/Aug/2026), got: ${LOG_DATE}" >&2
+  exit 1
+fi
+if [ -n "$HOUR_LIST" ] && ! [[ "$HOUR_LIST" =~ ^[0-9]{1,2}(,[0-9]{1,2})*$ ]]; then
+  echo "-w must be comma-separated hours (e.g. 06,07), got: ${HOUR_LIST}" >&2
+  exit 1
+fi
+if ! [[ "$MAX_SITES" =~ ^[0-9]+$ ]] || [ "$MAX_SITES" -lt 1 ]; then
+  echo "-n must be a positive integer (got: ${MAX_SITES})" >&2
+  exit 1
+fi
 
 # nginx timestamps access logs as dd/Mon/yyyy but error logs as yyyy/mm/dd.
 # Without both forms, -d would silently match nothing in any error log.
@@ -394,6 +412,15 @@ build_site_list() {
 
   while IFS="$(printf '\t')" read -r mtime label acc err; do
     [ -n "${acc:-}" ] || continue
+    # These paths come from `nginx -T` (or -s) and are interpolated into the
+    # command strings run() evaluates. Anyone who can write a config fragment
+    # could otherwise reach a root shell through an access_log directive, so a
+    # path containing anything a shell acts on is refused rather than escaped.
+    if ! [[ "$acc" =~ ^[A-Za-z0-9._@:+/-]+$ ]] \
+       || { [ -n "${err:-}" ] && ! [[ "$err" =~ ^[A-Za-z0-9._@:+/-]+$ ]]; }; then
+      warn "Ignoring a log path containing shell metacharacters: ${acc} (this is not a normal nginx log path — check who can write your nginx config)"
+      continue
+    fi
     SITE_LABEL+=("$label"); SITE_ACC+=("$acc"); SITE_ERR+=("$err")
   done <<< "$ranked"
 }
@@ -469,7 +496,7 @@ done
 if [ -n "$KA" ]; then
   note "lowest keepalive_timeout in the running config: ${KA}s (raw: $(printf '%s' "$KA_RAW" | paste -sd' ' -))"
   if [ "$(num "$KA")" -gt 0 ] && [ "$(num "$KA")" -lt 300 ]; then
-    warn "keepalive_timeout=${KA}s is shorter than Cloudflare's 900s idle reuse window. The edge will eventually reuse a connection this origin has already closed, and that surfaces as an intermittent 520/522 with NOTHING in the nginx logs. Set 'keepalive_timeout 905s;' in the http block."
+    warn "keepalive_timeout=${KA}s is shorter than Cloudflare's 900s Proxy Idle Timeout. The edge will eventually reuse a connection this origin has already closed, which the edge reports as 520 (its idle-timeout code) and leaves NOTHING in the nginx logs. Set 'keepalive_timeout 905s;' in the http block."
   else
     ok "keepalive_timeout=${KA}s outlives Cloudflare's connection reuse window."
   fi
@@ -477,7 +504,7 @@ else
   # An absent directive is NOT a neutral finding: nginx then uses its compiled
   # default of 75s, which is exactly the broken case. Reporting this as a note
   # kept the single most likely cause out of the verdict summary entirely.
-  warn "keepalive_timeout is NOT set anywhere in the running config, so nginx uses its built-in default of 75s — far below Cloudflare's 900s idle reuse window. The edge will reuse connections this origin has already closed and report 520/522, leaving no log line. Set 'keepalive_timeout 905s;' in the http block."
+  warn "keepalive_timeout is NOT set anywhere in the running config, so nginx uses its built-in default of 75s — far below Cloudflare's 900s Proxy Idle Timeout. The edge will reuse connections this origin has already closed and report 520, leaving no log line. Set 'keepalive_timeout 905s;' in the http block."
   note "low traffic makes this MORE likely, not less: a busy connection never sits idle long enough to cross the 75s line, while a quiet dev host crosses it constantly."
 fi
 
@@ -626,13 +653,13 @@ for _i in "${!SITE_LABEL[@]}"; do
     crit "${site}: the upstream closed or reset $(( $(num "$N_PREM") + $(num "$N_RST") )) connection(s) MID-RESPONSE during the window. Cloudflare reports exactly this as 520. The application died or was killed while serving a request — cross-check section 2 (OOM) and the app's own crash log below."
   fi
   if [ "$(num "$N_HDR")" -gt 0 ]; then
-    crit "${site}: ${N_HDR} oversized or invalid upstream header(s). Cloudflare caps response headers at 32KB total / 8KB per line; anything larger comes back as 520. Raise proxy_buffer_size, or shrink what the app emits — long Set-Cookie and JWT headers are the usual cause."
+    crit "${site}: ${N_HDR} oversized or invalid upstream header(s). Cloudflare caps response headers at 128 KB in total; anything larger comes back as 520. Raise proxy_buffer_size, or shrink what the app emits — long Set-Cookie and JWT headers are the usual cause."
   fi
   if [ "$(num "$N_NONE")" -gt 0 ]; then
     crit "${site}: 'no live upstreams' ${N_NONE} time(s) — nginx had marked every backend as failed, so every request in that period failed at the edge."
   fi
   if [ "$(num "$N_SLOW")" -gt 0 ]; then
-    warn "${site}: ${N_SLOW} upstream timeout(s). Any single request that exceeds 100s comes back as 524 rather than 502 — check proxy_read_timeout against the slowest endpoint."
+    warn "${site}: ${N_SLOW} upstream timeout(s). Any single request that exceeds 125s comes back as 524 rather than 502 — check proxy_read_timeout against the slowest endpoint."
   fi
 done
 [ "$SIG_SEEN" -eq 0 ] && note "(no error-log entries in the window for any configured site)"
@@ -755,7 +782,7 @@ else
   note "proxy_buffer_size=${PBS}"
 fi
 
-step "Slow requests (524 = origin exceeded Cloudflare's 100s response budget)"
+step "Slow requests (524 = origin exceeded Cloudflare's 125s response budget)"
 if printf '%s\n' "$NGX_CONF" | grep -q 'request_time'; then
   for _i in "${!SITE_LABEL[@]}"; do
     site="${SITE_LABEL[$_i]}"
@@ -1085,24 +1112,29 @@ ${C_BLD}How to read this report${C_OFF}
         the app dies every few minutes and pm2 silently restarts it. That is
         the textbook "520, then fine again a minute later".)
     2. nginx worker exited on a signal                     -> section 6b
-    3. Response headers above Cloudflare's 32KB cap        -> section 6b
+    3. Response headers above Cloudflare's 128 KB cap      -> section 6b
     4. Upstream reset the connection mid-response          -> section 6b
+    5. keepalive_timeout below Cloudflare's 900s idle window -> section 5
+       (the classic INTERMITTENT failure on a host that looks healthy: the
+        edge reuses a connection this origin already closed. Cloudflare's
+        Proxy Idle Timeout is 900s and returns 520 when it fires. It leaves
+        no log line anywhere, so a clean report plus a short keepalive_timeout
+        IS the finding.)
 
   ${C_BLD}522${C_OFF} — the edge never completed a TCP handshake.
     1. Listen-queue overflow or conntrack full             -> section 8 / 5
     2. Memory collapse or IO storm (often a build)         -> section 4 / 7
     3. nginx down or config not loaded                     -> section 5
-    4. keepalive_timeout below Cloudflare's 900s           -> section 5
-       (the classic INTERMITTENT 522 on a host that looks healthy: the edge
-        reuses a connection this origin already closed. It leaves no log line
-        anywhere, so a clean report plus a short keepalive_timeout IS the
-        finding.)
+    4. Keepalives refused outright by the origin           -> section 5
+       (Cloudflare lists "keepalives are disabled at the origin" as a 522
+        cause. A keepalive_timeout that is merely SHORT returns 520 instead
+        — see the 520 list above.)
     5. Origin IP leaked and being hit directly             -> section 9
     6. Security group not tracking Cloudflare's current ranges
        (invisible from this host — verify it in the cloud console)
 
   ${C_BLD}521${C_OFF} — connection refused: nginx down, or a firewall REJECT  -> section 5
-  ${C_BLD}524${C_OFF} — connected, but no complete response within 100s       -> section 6b
+  ${C_BLD}524${C_OFF} — connected, but no complete response within 125s       -> section 6b
   ${C_BLD}526${C_OFF} — origin certificate expired or untrusted               -> section 6b
 
   ${C_BLD}520 and 522 alternating${C_OFF} on one host is a finding in itself: the upstream

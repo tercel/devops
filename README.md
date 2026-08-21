@@ -33,10 +33,10 @@ the wrong direction from the start.
 
 | Code | Meaning | Typical cause | Where the evidence is |
 |---|---|---|---|
-| **520** | The edge connected; the origin replied with something unparseable | Upstream app crashed or was OOM-killed, nginx worker died, response headers over 32KB, connection reset | **In the nginx error log** |
+| **520** | The edge connected; the origin replied with something empty, malformed or unexpected | Upstream app crashed or was OOM-killed, nginx worker died, response headers over 128 KB, connection reset mid-response, **or a connection left idle past the 900s Proxy Idle Timeout** | **In the nginx error log** |
 | **521** | The origin refused the connection | nginx not running, or a firewall REJECT (not DROP) | Service status, firewall |
-| **522** | The TCP handshake never completed | Listen-queue overflow, conntrack full, memory/IO collapse, **keepalive_timeout shorter than Cloudflare's reuse window** | Kernel counters; **the nginx log is empty** |
-| **524** | Connected, but no complete response within 100s | Slow upstream, or `proxy_read_timeout` cutting a streaming response short | `$request_time` in the access log |
+| **522** | The edge gave up connecting: no SYN+ACK within 19s, or no ACK of its request within 90s once connected | Listen-queue overflow, conntrack full, memory/IO collapse, **keepalives disabled at the origin** | Kernel counters; **the nginx log is empty** |
+| **524** | Connected, but no complete response within the 125s Proxy Read Timeout | Slow upstream, or `proxy_read_timeout` cutting a streaming response short | `$request_time` in the access log |
 | **526** | Origin certificate expired or untrusted | Certificate expiry (when SSL mode is Full strict) | Certificate validity |
 
 Two counter-intuitive readings that matter:
@@ -45,6 +45,13 @@ Two counter-intuitive readings that matter:
   It proves the requests never reached nginx, which is exactly what 522 means.
 - **For 520 the opposite holds.** The evidence lives in the error log, so a
   clean log largely rules 520 out.
+
+**A `keepalive_timeout` below 900s surfaces as 520, not 522.** Cloudflare's
+Proxy Idle Timeout is 900s and returns **520** when it fires; **522** is what
+you get when the origin refuses keepalive outright. Same setting, two different
+codes — which is why a diagnosis has to name the code it actually observed
+instead of assuming one. Low-traffic sites are more exposed, not less: an idle
+connection is what crosses the timeout.
 
 **520 and 522 alternating on one host is itself a finding**: the upstream is
 restarting under memory pressure. While it is down the edge cannot connect
@@ -154,7 +161,7 @@ the combination of the three probes classifies an incident without guesswork:
 | edge | local | upstream | Conclusion |
 |---|---|---|---|
 | 522 | 200 | 200 | The host served fine locally; the edge could not reach it → network / firewall / keepalive |
-| 520 | 502 | **000** | **The backend was down**, nginx had nothing to proxy to → the classic "it fixed itself a minute later" |
+| 520 or 502 | 502 | **000** | **The backend was down** and nginx had nothing to proxy to → the classic "it fixed itself a minute later". A valid 502 is normally passed through by the edge, so a 520 here means *that* edge request got an empty or truncated response — the three probes are separate requests, not one request seen three ways |
 | 520 | 200 | 200 | The backend answered but produced something unparseable → check header size and connection resets |
 | any 5xx | — | — | Read `iowait_pct` / `steal_pct` on the same row → resource stall |
 
@@ -209,7 +216,7 @@ Several URLs may be passed at once; each is probed on every pass.
 |---|---|---|
 | `-1` | — | Single check, prints the full response headers |
 | `-i N` | `60` | Loop interval in seconds, minimum 5 |
-| `-o IP` | none | **Also probe the origin directly** (via `--resolve`, keeping Host and SNI intact) |
+| `-o IP` | none | **Also probe the origin directly** (via `--resolve`, keeping Host, SNI and any explicit port intact) |
 | `-k` | — | Accept untrusted certificates (usually needed when probing the origin directly) |
 | `-P` | — | Bypass the local proxy |
 | `-f FILE` | `~/52x-probe.csv` | CSV path |
@@ -262,7 +269,7 @@ to the snapshot directory.
 | Symptom | Cause | Which script finds it |
 |---|---|---|
 | Random 520, clean logs, recovers on its own | Node's `JavaScript heap out of memory`. This is V8's own limit — it **never goes through the kernel OOM killer, so dmesg shows nothing** | `diag` 6b |
-| Random 520/522 while every host metric looks fine | `keepalive_timeout` shorter than Cloudflare's 900s reuse window. **Low-traffic sites are more exposed**, not less — an idle connection is what crosses the timeout | `diag` 5 |
+| Random 520 (sometimes 522) while every host metric looks fine | `keepalive_timeout` shorter than Cloudflare's 900s Proxy Idle Timeout, which returns 520; an origin that refuses keepalive outright returns 522 instead. **Low-traffic sites are more exposed**, not less — an idle connection is what crosses the timeout | `diag` 5 |
 | 520 on streaming requests for one vhost | That vhost is missing `proxy_read_timeout`, so nginx cuts the response at its 60s default | `diag` 6b (per-vhost audit names the file) |
 | 502/522 during deploys | Process manager running a single fork instance; `restart` leaves a window with no upstream at all | `diag` 7; `up_code=000` in `watch` |
 | 522 under load | Listen-queue overflow or conntrack exhaustion | `diag` 5, 8; `listen_ovf` in `watch` |
@@ -297,6 +304,13 @@ recorded zeros when they were missing.
   alignment.
 - `probe-52x.sh` single-shot probing, proxy detection and failure snapshots
   were tested for real on the local machine.
+- The hardening in this revision was exercised directly: `-d` and `-w` reject
+  shell metacharacters; a log path carrying them is refused rather than run; a
+  URL containing a comma is rejected before it can shift a CSV column;
+  authority parsing was checked against eight forms (explicit port, userinfo,
+  bracketed IPv6, non-numeric port); and five concurrent `watch-52x.sh`
+  instances yielded exactly one lock holder and four refusals, with stale-lock
+  recovery verified separately.
 - **None of the three has been run end-to-end on a real Linux server.** The
   development machine is macOS, with no nginx, pm2 or `/proc`. On first use,
   run in the foreground once and confirm that the "Discovered sites" section of
@@ -305,7 +319,10 @@ recorded zeros when they were missing.
 This caveat is one of the reasons the rewrite exists: the `System` seam in
 [architecture §3.6](docs/architecture.md) puts every filesystem and process
 access behind a trait that fixtures can stand in for, which turns "never tested
-on Linux" into a test suite that runs anywhere.
+on Linux" into a test suite that runs anywhere. Those fixtures are meant to come
+from real hosts — the planned `whatbroke capture` records one run's evidence into
+a redacted bundle — so a box that actually breaks becomes a permanent regression
+test instead of an anecdote.
 
 ---
 
