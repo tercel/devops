@@ -361,7 +361,7 @@ Where each script lands:
 |---|---|
 | `diag-52x.sh` | The check catalogue plus the correlation rules — the core of the product |
 | `watch-52x.sh` | Retired. Netdata and `sar` already record; the Netdata plugin surface covers the continuous signal |
-| `probe-52x.sh` | Stays a laptop-side tool for now; its edge/colo logic becomes `edge.cloudflare.*` checks |
+| `probe-52x.sh` | Absorbed. Its edge/colo logic becomes `edge.cloudflare.*` checks producing external-vantage evidence, reached via `whatbroke run --probe` rather than a separate command |
 
 ### Removed
 
